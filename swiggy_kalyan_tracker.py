@@ -12,6 +12,7 @@ Env vars (or a .env file next to this script):
   TRACK_WORDS          comma list, ALL must appear in item name+brand. default "kalyan,gold coin"
   STATE_FILE           default kalyan_state.json (lost on restart on hosts without a disk)
   INSTAMART_COOKIE     optional: a Cookie header string to pin your delivery location
+  NOTIFY_ERRORS        default 0 = Telegram gets ONLY price changes and new SKUs. 1 = also failure warnings.
   X_BUILD_VERSION      optional: Instamart web build, default 2.392.0
 """
 import gzip
@@ -57,6 +58,7 @@ QUERY = os.environ.get("SEARCH_QUERY", "kalyan gold coin")
 WORDS = [w.strip().lower() for w in os.environ.get("TRACK_WORDS", "kalyan,gold coin").split(",") if w.strip()]
 STATE_FILE = os.environ.get("STATE_FILE", os.path.join(HERE, "kalyan_state.json"))
 COOKIE = os.environ.get("INSTAMART_COOKIE", "").strip()
+NOTIFY_ERRORS = os.environ.get("NOTIFY_ERRORS", "0").strip() == "1"  # 1 = also Telegram a warning when checks keep failing
 BUILD = os.environ.get("X_BUILD_VERSION", "2.392.0").strip()
 try:
     INTERVAL = max(MIN_INTERVAL, int(os.environ.get("CHECK_INTERVAL_SEC", "60")))
@@ -174,7 +176,6 @@ class Session:
             "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
             "Upgrade-Insecure-Requests": "1"}))
         status, _ = self._open(req)
-        log(f"DIAG home page: {self.last}")
         if status in (403, 405, 429):
             raise Blocked(f"home page HTTP {status}")
         self.warm = True
@@ -195,28 +196,31 @@ class Session:
         req = urllib.request.Request(SEARCH_URL, data=body, method="POST", headers=self._headers(extra))
         status, text = self._open(req)
         if status in (403, 405, 429) or status >= 500:
-            log(f"DIAG search: {self.last}")
             raise Blocked(f"HTTP {status}")
         try:
             doc = json.loads(text)
         except json.JSONDecodeError:
             raise Blocked(f"HTTP {status}, not JSON (bot check page?): {text[:80]!r}")
         if isinstance(doc, dict) and doc.get("statusCode") == 429:
-            log(f"DIAG search: {self.last}")
             raise Blocked("rate limited (429 inside JSON)")
         return doc
 
 
 VARIANTS = ["bare", "minimal", "cookies"]
+PROVEN = set()  # request styles that have returned real data in this run
 
 
 def search_any(prefer):
     """Try the preferred request style first, then the others, a few seconds apart (max 3 requests)."""
+    if prefer in PROVEN:  # a style already worked: a 429 now is a plain rate limit, so just back off
+        return Session(prefer).search(), prefer
     i = VARIANTS.index(prefer)
     last = None
     for v in VARIANTS[i:] + VARIANTS[:i]:
         try:
-            return Session(v).search(), v
+            doc = Session(v).search()
+            PROVEN.add(v)
+            return doc, v
         except Blocked as e:
             log(f"Request style '{v}' refused: {e}")
             last = e
@@ -289,75 +293,84 @@ def link():
     return "https://instamart.in/search?query=" + urllib.parse.quote(QUERY)
 
 
+def short(name):
+    return name.replace("Kalyan Jewellers ", "").strip()
+
+
 def compare(state, current):
-    alerts = []
-    had_state = bool(state)  # decide once: the first scan must not flag every item as new
+    """Update state. Return ONE batched message (or None) for price changes and new SKUs only."""
+    had_state = bool(state)  # decide once: the first scan must stay silent, not flag every item as new
+    changed, new = [], []
     for sku, cur in current.items():
         old = state.get(sku)
-        label = f"{cur['name']}\nSKU {sku}"
         if old is None:
             if had_state:
-                alerts.append(f"🆕 NEW LISTING\n{label}\n{inr(cur['price'])} (MRP {inr(cur['mrp'] or 0)})\n{link()}")
-        else:
-            if cur["price"] != old["price"]:
-                diff = cur["price"] - old["price"]
-                pct = diff / old["price"] * 100 if old["price"] else 0
-                icon, word = ("🔺", "PRICE UP") if diff > 0 else ("🔻", "PRICE DOWN")
-                alerts.append(f"{icon} {word}\n{label}\n{inr(old['price'])} → {inr(cur['price'])} "
-                              f"({'+' if diff > 0 else '-'}{inr(abs(diff))}, {pct:+.1f}%)\n{link()}")
-            if cur["in_stock"] != old.get("in_stock", True):
-                alerts.append(("✅ BACK IN STOCK" if cur["in_stock"] else "⛔ OUT OF STOCK") + f"\n{label}\n{inr(cur['price'])}")
+                new.append(f"🆕 NEW: {short(cur['name'])}\n    {inr(cur['price'])} (MRP {inr(cur['mrp'] or 0)}) · SKU {sku}")
+        elif cur["price"] != old["price"]:
+            diff = cur["price"] - old["price"]
+            pct = diff / old["price"] * 100 if old["price"] else 0
+            icon = "🔺" if diff > 0 else "🔻"
+            sign = "+" if diff > 0 else "-"
+            changed.append(f"{icon} {short(cur['name'])}\n    {inr(old['price'])} → {inr(cur['price'])}  "
+                           f"({sign}{inr(abs(diff))} | {pct:+.1f}%)")
         state[sku] = {**cur, "misses": 0}
-    for sku, old in list(state.items()):
+    for sku, old in state.items():
         if sku not in current:
-            old["misses"] = old.get("misses", 0) + 1
-            if old["misses"] == MISSES_BEFORE_GONE:
-                alerts.append(f"❓ NOT SHOWING IN SEARCH\n{old['name']}\nSKU {sku}\nLast price {inr(old['price'])}")
-    return alerts
+            old["misses"] = old.get("misses", 0) + 1  # kept only in the state file; no alert
+    if not changed and not new:
+        return None
+    parts = ["💰 Kalyan gold coin update"] + changed + new + [link()]
+    return "\n".join(parts)
+
+
+def send_long(text):
+    """Telegram allows 4096 characters per message: split on line breaks if needed."""
+    chunk = ""
+    for line in text.split("\n"):
+        if len(chunk) + len(line) + 1 > 3800:
+            send(chunk)
+            chunk = ""
+        chunk += ("\n" if chunk else "") + line
+    if chunk:
+        send(chunk)
 
 
 def main():
     if "--get-chat-id" in sys.argv:
         return get_chat_id()
     log(f"Tracking '{QUERY}' (match: {WORDS}) every ~{INTERVAL}s. Plain HTTP, no browser. State: {STATE_FILE}")
-    try:  # one-off: which public IP does this host use? (helps judge IP blocks)
-        with urllib.request.urlopen("https://api.ipify.org", timeout=10) as r:
-            log(f"DIAG this host's public IP: {r.read().decode().strip()}")
-    except Exception as e:  # noqa: BLE001
-        log(f"DIAG could not read public IP ({e})")
     state = load_state()
     prefer = VARIANTS[0]
-    fails, warned, first = 0, False, not state
+    fails, warned, scans = 0, False, 0
     while True:
         wait = INTERVAL
         try:
             doc, used = search_any(prefer)
-            if used != prefer or fails or first:
+            if used != prefer or fails or scans == 0:
                 log(f"Request style that works: '{used}'")
             prefer = used
             current = parse_items(doc)
+            scans += 1
             if not current:
                 log("Search worked but no matching items this scan (items gone, or a different store).")
             else:
-                alerts = compare(state, current)
+                message = compare(state, current)
                 save_state(state)
-                if first:
-                    lines = "\n".join(f"• {d['name']} — {inr(d['price'])}" for d in current.values())
-                    send(f"📈 Tracking started ({len(current)} item(s)). Check every ~{INTERVAL}s.\n{lines}")
-                    first = False
-                for a in alerts:
-                    send(a)
-                log(f"OK: {len(current)} matching item(s).")
-            if warned:
+                if message:
+                    send_long(message)  # the ONLY thing sent to Telegram: price change or new SKU
+                if scans == 1 or message:
+                    log(f"OK: {len(current)} matching item(s)." + (" Change sent." if message else " Baseline saved."))
+            if warned and NOTIFY_ERRORS:
                 send("✅ Tracker recovered.")
             fails, warned = 0, False
         except Exception as e:  # noqa: BLE001
             fails += 1
-            wait = min(INTERVAL * (2 ** min(fails, 6)), 1800)
-            log(f"Check failed ({fails}): {e}. Next try in {wait}s")
+            wait = min(INTERVAL * (2 ** (fails - 1)), 600)  # gentle: 1x, 2x, 4x ... capped at 10 min
+            log(f"Check failed ({fails}): {e}. Next try in ~{wait}s")
             if fails == 5 and not warned:
-                send(f"⚠️ Tracker failing 5x in a row: {e}")
                 warned = True
+                if NOTIFY_ERRORS:
+                    send(f"⚠️ Tracker failing 5x in a row: {e}")
         time.sleep(wait * random.uniform(0.9, 1.1))
 
 
