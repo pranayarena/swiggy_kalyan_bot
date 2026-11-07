@@ -115,13 +115,24 @@ class Blocked(Exception):
 class Session:
     """Cookie-keeping HTTP session that looks like Chrome. Reset it when blocked."""
 
-    def __init__(self):
+    def __init__(self, variant="bare"):
+        # bare    = no cookies, browser-like headers, no home-page visit
+        # minimal = no cookies, only User-Agent + JSON headers (closest to the call that worked in a browser)
+        # cookies = visit the home page first and keep its cookies
+        self.variant = variant
         self.jar = http.cookiejar.CookieJar()
-        self.opener = urllib.request.build_opener(urllib.request.HTTPCookieProcessor(self.jar))
-        self.warm = False
+        if variant == "cookies":
+            self.opener = urllib.request.build_opener(urllib.request.HTTPCookieProcessor(self.jar))
+        else:
+            self.opener = urllib.request.build_opener()
+        self.warm = variant != "cookies"
         self.last = ""
 
     def _headers(self, extra=None):
+        if self.variant == "minimal":
+            h = {"User-Agent": UA, "Accept-Encoding": "gzip"}
+            h.update(extra or {})
+            return h
         h = {"User-Agent": UA, "Accept-Encoding": "gzip", "Accept-Language": "en-IN,en;q=0.9",
              "sec-ch-ua": '"Not-A.Brand";v="99", "Google Chrome";v="157", "Chromium";v="157"',
              "sec-ch-ua-mobile": "?0", "sec-ch-ua-platform": '"Windows"'}
@@ -174,10 +185,14 @@ class Session:
             time.sleep(random.uniform(1.0, 2.5))
         body = json.dumps({"facets": [], "sortAttribute": "", "query": QUERY, "search_results_offset": "0",
                            "page_type": "INSTAMART_SEARCH_PAGE", "is_pre_search_tag": False}).encode()
-        req = urllib.request.Request(SEARCH_URL, data=body, method="POST", headers=self._headers({
-            "Accept": "*/*", "Content-Type": "application/json", "Origin": "https://instamart.in",
-            "Referer": "https://instamart.in/search?custom_back=true&query=" + urllib.parse.quote(QUERY),
-            "x-build-version": BUILD}))
+        extra = {"Accept": "*/*", "Content-Type": "application/json"}
+        if self.variant != "minimal":
+            extra.update({"Origin": "https://instamart.in",
+                          "Referer": "https://instamart.in/search?custom_back=true&query=" + urllib.parse.quote(QUERY),
+                          "Sec-Fetch-Dest": "empty", "Sec-Fetch-Mode": "cors", "Sec-Fetch-Site": "same-origin"})
+        if self.variant == "cookies":
+            extra["x-build-version"] = BUILD
+        req = urllib.request.Request(SEARCH_URL, data=body, method="POST", headers=self._headers(extra))
         status, text = self._open(req)
         if status in (403, 405, 429) or status >= 500:
             log(f"DIAG search: {self.last}")
@@ -190,6 +205,23 @@ class Session:
             log(f"DIAG search: {self.last}")
             raise Blocked("rate limited (429 inside JSON)")
         return doc
+
+
+VARIANTS = ["bare", "minimal", "cookies"]
+
+
+def search_any(prefer):
+    """Try the preferred request style first, then the others, a few seconds apart (max 3 requests)."""
+    i = VARIANTS.index(prefer)
+    last = None
+    for v in VARIANTS[i:] + VARIANTS[:i]:
+        try:
+            return Session(v).search(), v
+        except Blocked as e:
+            log(f"Request style '{v}' refused: {e}")
+            last = e
+            time.sleep(random.uniform(3, 6))
+    raise last
 
 
 def to_int(v):
@@ -259,11 +291,12 @@ def link():
 
 def compare(state, current):
     alerts = []
+    had_state = bool(state)  # decide once: the first scan must not flag every item as new
     for sku, cur in current.items():
         old = state.get(sku)
         label = f"{cur['name']}\nSKU {sku}"
         if old is None:
-            if state:
+            if had_state:
                 alerts.append(f"🆕 NEW LISTING\n{label}\n{inr(cur['price'])} (MRP {inr(cur['mrp'] or 0)})\n{link()}")
         else:
             if cur["price"] != old["price"]:
@@ -293,12 +326,16 @@ def main():
     except Exception as e:  # noqa: BLE001
         log(f"DIAG could not read public IP ({e})")
     state = load_state()
-    session = Session()
+    prefer = VARIANTS[0]
     fails, warned, first = 0, False, not state
     while True:
         wait = INTERVAL
         try:
-            current = parse_items(session.search())
+            doc, used = search_any(prefer)
+            if used != prefer or fails or first:
+                log(f"Request style that works: '{used}'")
+            prefer = used
+            current = parse_items(doc)
             if not current:
                 log("Search worked but no matching items this scan (items gone, or a different store).")
             else:
@@ -317,8 +354,6 @@ def main():
         except Exception as e:  # noqa: BLE001
             fails += 1
             wait = min(INTERVAL * (2 ** min(fails, 6)), 1800)
-            if isinstance(e, Blocked) or fails >= 2:
-                session = Session()  # fresh cookies for the next try
             log(f"Check failed ({fails}): {e}. Next try in {wait}s")
             if fails == 5 and not warned:
                 send(f"⚠️ Tracker failing 5x in a row: {e}")
