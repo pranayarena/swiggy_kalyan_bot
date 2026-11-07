@@ -1,1 +1,1 @@
-playwright==1.49.0
+# no packages needed: the tracker uses only the Python standard library
