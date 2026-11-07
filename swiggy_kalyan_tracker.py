@@ -119,6 +119,7 @@ class Session:
         self.jar = http.cookiejar.CookieJar()
         self.opener = urllib.request.build_opener(urllib.request.HTTPCookieProcessor(self.jar))
         self.warm = False
+        self.last = ""
 
     def _headers(self, extra=None):
         h = {"User-Agent": UA, "Accept-Encoding": "gzip", "Accept-Language": "en-IN,en;q=0.9",
@@ -135,15 +136,25 @@ class Session:
             raw = gzip.decompress(raw)
         return raw.decode("utf-8", errors="replace")
 
+    def _note(self, status, headers, body):
+        """Remember a short, secret-free summary of the last response, for the failure log."""
+        keep = {k.lower(): v for k, v in headers.items()
+                if k.lower() in ("server", "via", "retry-after", "content-type", "content-length", "x-cache")
+                or k.lower().startswith(("x-amzn", "x-waf", "cf-"))}
+        self.last = f"status={status} headers={keep} body={body[:120]!r} cookies={[c.name for c in self.jar]}"
+
     def _open(self, req):
         try:
             with self.opener.open(req, timeout=30) as r:
-                return r.status, self._read(r)
+                body = self._read(r)
+                self._note(r.status, r.headers, body)
+                return r.status, body
         except urllib.error.HTTPError as e:
             try:
                 body = self._read(e)
             except Exception:  # noqa: BLE001
                 body = ""
+            self._note(e.code, e.headers, body)
             return e.code, body
 
     def warm_up(self):
@@ -152,6 +163,7 @@ class Session:
             "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
             "Upgrade-Insecure-Requests": "1"}))
         status, _ = self._open(req)
+        log(f"DIAG home page: {self.last}")
         if status in (403, 405, 429):
             raise Blocked(f"home page HTTP {status}")
         self.warm = True
@@ -168,12 +180,14 @@ class Session:
             "x-build-version": BUILD}))
         status, text = self._open(req)
         if status in (403, 405, 429) or status >= 500:
+            log(f"DIAG search: {self.last}")
             raise Blocked(f"HTTP {status}")
         try:
             doc = json.loads(text)
         except json.JSONDecodeError:
             raise Blocked(f"HTTP {status}, not JSON (bot check page?): {text[:80]!r}")
         if isinstance(doc, dict) and doc.get("statusCode") == 429:
+            log(f"DIAG search: {self.last}")
             raise Blocked("rate limited (429 inside JSON)")
         return doc
 
@@ -273,6 +287,11 @@ def main():
     if "--get-chat-id" in sys.argv:
         return get_chat_id()
     log(f"Tracking '{QUERY}' (match: {WORDS}) every ~{INTERVAL}s. Plain HTTP, no browser. State: {STATE_FILE}")
+    try:  # one-off: which public IP does this host use? (helps judge IP blocks)
+        with urllib.request.urlopen("https://api.ipify.org", timeout=10) as r:
+            log(f"DIAG this host's public IP: {r.read().decode().strip()}")
+    except Exception as e:  # noqa: BLE001
+        log(f"DIAG could not read public IP ({e})")
     state = load_state()
     session = Session()
     fails, warned, first = 0, False, not state
