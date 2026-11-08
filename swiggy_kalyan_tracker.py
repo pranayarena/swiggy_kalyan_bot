@@ -18,8 +18,8 @@ Env vars (or a .env file next to this script):
   TELEGRAM_ADMIN_ID    optional: your numeric Telegram user id(s), comma separated, allowed to use /status
   LOCATIONS            optional: "Label=search text;Label2=search text2". Search text can be an area,
                        "pincode city" or an address. Default list: see DEFAULT_LOCATIONS below.
-  CHECK_INTERVAL_SEC   seconds between rounds over all cities, default 120, minimum 30
-  REQUEST_GAP_SEC      pause between single Instamart calls, default 1.5, minimum 1
+  CHECK_INTERVAL_SEC   seconds between rounds over all cities, default 300, minimum 30
+  REQUEST_GAP_SEC      pause between single Instamart calls, default 3, minimum 1
   INITIAL_REPORT       default 1 = one stock-check message on a start with no saved state. Set 0 on Voroa after the first deploy (no disk, state resets)
   SEARCH_QUERY         default "kalyan gold coin"
   TRACK_WORDS          comma list, ALL must appear in item name+brand. default "kalyan,gold coin"
@@ -55,9 +55,10 @@ IST = timezone(timedelta(hours=5, minutes=30))
 # and dropped automatically. Instamart does not serve every city; that city just shows "no coins listed".
 # Override with LOCATIONS="City=pin1,pin2;City2=pin"  (a pincode, area or address, anything the site search accepts).
 DEFAULT_LOCATIONS = (
-    "Mumbai=400053,400050,400076,400601;Pune=411001,411045,411014;Nashik=422005,422101,422002;"
-    "Bengaluru=560034,560066,560102;Chennai=600017,600042,600040;Hyderabad=500034,500081,500032;"
-    "Delhi=110001,110017,110075;Kolkata=700091,700019;Ahmedabad=380015,380054;Surat=395009,395007;"
+    "Mumbai=400053,400050,400076,400601;Pune=411045,411001,411014,411057;Nashik=422005,422101,422002,422009;"
+    "Bengaluru=560034,560066,560102,560038;Chennai=600017,600042,600040,600020;"
+    "Hyderabad=500034,500081,500032,500016;Delhi=110017,110001,110075,110092;"
+    "Kolkata=700091,700019,700156;Ahmedabad=380015,380054,380009;Surat=395009,395007;"
     "Vadodara=390007;Rajkot=360005;Jaipur=302017;Kochi=682024"
 )
 
@@ -86,14 +87,14 @@ STATE_FILE = os.environ.get("STATE_FILE", os.path.join(HERE, "kalyan_state_pins.
 BUILD = os.environ.get("X_BUILD_VERSION", "2.392.0").strip()
 NOTIFY_ERRORS = os.environ.get("NOTIFY_ERRORS", "0").strip() == "1"
 try:
-    INTERVAL = max(30, int(os.environ.get("CHECK_INTERVAL_SEC", "120")))
+    INTERVAL = max(30, int(os.environ.get("CHECK_INTERVAL_SEC", "300")))
 except ValueError:
-    INTERVAL = 120
+    INTERVAL = 300
 try:
-    BASE_GAP = max(1.0, float(os.environ.get("REQUEST_GAP_SEC", "1.5")))
+    BASE_GAP = max(1.0, float(os.environ.get("REQUEST_GAP_SEC", "3")))
 except ValueError:
-    BASE_GAP = 1.5
-MAX_SCALE = 16.0  # slowest the tracker will ever go: 16x its normal pace
+    BASE_GAP = 3.0
+MAX_SCALE = 6.0  # slowest the tracker will ever go: 6x its normal pace
 INITIAL_REPORT = os.environ.get("INITIAL_REPORT", "1").strip() != "0"
 LINK = BASE + "/search?query=" + urllib.parse.quote(QUERY)  # opens the Swiggy app on a phone
 DRY = "--once" in sys.argv  # dry run: print only, send nothing, save nothing
@@ -167,13 +168,34 @@ def get_chat_id():
 
 
 # ---------- Instamart ----------
+PLACES = {}
+PLACES_FILE = os.path.join(HERE, "kalyan_places.json")
+
+
+def save_places():
+    if DRY:
+        return
+    try:
+        with open(PLACES_FILE, "w", encoding="utf-8") as f:
+            json.dump(PLACES, f)
+    except OSError:
+        pass
+
+
+try:
+    with open(PLACES_FILE, encoding="utf-8") as _f:
+        PLACES.update(json.load(_f))
+except (OSError, json.JSONDecodeError):
+    pass
+
+
 class Blocked(Exception):
     """Instamart refused: 429 rate limit, 403/405 bot check, empty or non-JSON reply."""
     limited = False
 
 
 class Pacer:
-    """Spaces every Instamart call. A 429 doubles the pause (up to 16x); every good call eases it back."""
+    """Spaces every Instamart call. A 429 raises the pause 1.5x (up to 6x); every good call eases it back."""
 
     def __init__(self):
         self.scale, self.last = 1.0, 0.0
@@ -184,13 +206,13 @@ class Pacer:
         self.last = time.time()
 
     def hit(self):
-        old, self.scale = self.scale, min(self.scale * 2, MAX_SCALE)
+        old, self.scale = self.scale, min(self.scale * 1.5, MAX_SCALE)
         if self.scale != old:
             log(f"429 too many requests -> slowing down: {BASE_GAP * self.scale:.1f}s between calls, "
                 f"{INTERVAL * self.scale:.0f}s between rounds")
 
     def ok(self):
-        old, self.scale = self.scale, max(1.0, self.scale * 0.92)
+        old, self.scale = self.scale, max(1.0, self.scale * 0.97)
         if old > 1.0 and self.scale == 1.0:
             log("Instamart is happy again -> back to normal speed")
 
@@ -293,16 +315,23 @@ class City:
             if e.limited:
                 PACER.hit()
             raise e
-        found = self._call("GET", BASE + "/api/instamart/maps/suggestions?input=" + urllib.parse.quote(f"{self.text} {self.city}" if self.text.isdigit() else self.text))
-        places = found.get("data") or []
-        if not places:
-            raise NoPlace(f"no place found for '{self.text}'")
-        info = self._call("GET", BASE + "/api/instamart/maps/address-widgets/v2?place_id="
-                          + urllib.parse.quote(places[0]["place_id"]))
-        addr = (info.get("data") or {}).get("address") or {}
-        loc = addr.get("location") or {}
-        if "latitude" not in loc:
-            raise Blocked("place details had no coordinates")
+        hit = PLACES.get(self.label)  # coordinates found on an earlier run: skips two calls
+        if hit:
+            addr = hit
+            loc = hit["location"]
+        else:
+            found = self._call("GET", BASE + "/api/instamart/maps/suggestions?input=" + urllib.parse.quote(f"{self.text} {self.city}" if self.text.isdigit() else self.text))
+            places = found.get("data") or []
+            if not places:
+                raise NoPlace(f"no place found for '{self.text}'")
+            info = self._call("GET", BASE + "/api/instamart/maps/address-widgets/v2?place_id="
+                              + urllib.parse.quote(places[0]["place_id"]))
+            addr = (info.get("data") or {}).get("address") or {}
+            loc = addr.get("location") or {}
+            if "latitude" not in loc:
+                raise Blocked("place details had no coordinates")
+            PLACES[self.label] = {"subtitle": addr.get("subtitle", ""), "location": loc}
+            save_places()
         self._call("POST", BASE + "/api/instamart/home/select-location/v2", {"data": {
             "lat": loc["latitude"], "lng": loc["longitude"], "address": addr.get("subtitle", ""), "addressId": "",
             "annotation": addr.get("subtitle", ""), "clientId": "INSTAMART-APP"}})
