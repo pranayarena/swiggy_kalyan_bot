@@ -19,7 +19,7 @@ Env vars (or a .env file next to this script):
   LOCATIONS            optional: "Label=search text;Label2=search text2". Search text can be an area,
                        "pincode city" or an address. Default list: see DEFAULT_LOCATIONS below.
   CHECK_INTERVAL_SEC   seconds between full rounds, default 900, minimum 600
-  MIN_CITY_GAP_SEC     floor for adaptive city pacing, default 20
+  MIN_CITY_GAP_SEC     floor for adaptive city pacing, default 5
   SEARCH_QUERY         default "kalyan gold coin"
   TRACK_WORDS          comma list, ALL must appear in item name+brand. default "kalyan,gold coin"
   STATE_FILE           default kalyan_state_cities.json (lost on restart on hosts without a disk)
@@ -91,10 +91,10 @@ try:
 except ValueError:
     INTERVAL = 900
 try:
-    MIN_CITY_GAP_SEC = max(15, int(os.environ.get("MIN_CITY_GAP_SEC", "20")))
+    MIN_CITY_GAP_SEC = max(5, int(os.environ.get("MIN_CITY_GAP_SEC", "5")))
 except ValueError:
-    MIN_CITY_GAP_SEC = 20
-PACE_STEP_SEC = 5
+    MIN_CITY_GAP_SEC = 5
+PACE_STEP_SEC = 2
 DRY = "--once" in sys.argv  # dry run: print only, send nothing, save nothing
 RATE_LIMIT_UNTIL = 0.0
 RATE_LIMIT_STREAK = 0
@@ -151,14 +151,17 @@ def tg_api(method, payload=None, timeout=20):
         return json.loads(r.read().decode())
 
 
-def send(text):
+def send(text, buttons=None):
     if DRY or not TOKEN or not CHAT_ID:
         log("ALERT (not sent): " + text.replace("\n", " | "))
         return False
     log("ALERT sent: " + text.split("\n")[0])
     for _ in range(2):
         try:
-            tg_api("sendMessage", {"chat_id": CHAT_ID, "text": text, "disable_web_page_preview": True})
+            payload = {"chat_id": CHAT_ID, "text": text, "disable_web_page_preview": True}
+            if buttons:
+                payload["reply_markup"] = {"inline_keyboard": buttons}
+            tg_api("sendMessage", payload)
             return True
         except Exception as e:  # noqa: BLE001
             log(f"Telegram send failed ({e})")
@@ -177,6 +180,29 @@ def send_long(text):
         chunk += ("\n" if chunk else "") + line
     if chunk:
         all_sent = send(chunk) and all_sent
+    return all_sent
+
+
+def send_city_report(title, reference, city_blocks, reference_url=GOODRETURNS_URL):
+    """Send a clean report in Telegram-sized chunks with one Swiggy button per city."""
+    if not city_blocks:
+        return False
+    prefix = title + ("\n" + reference if reference else "")
+    chunk, buttons = prefix, []
+    include_reference_button = bool(reference_url)
+    all_sent = True
+    for block in city_blocks:
+        text = block["text"]
+        if buttons and len(chunk) + len(text) + 2 > 3400:
+            all_sent = send(chunk, buttons) and all_sent
+            chunk, buttons = prefix, []
+            include_reference_button = False
+        chunk += "\n\n" + text
+        buttons.append([{"text": f"Open {block['label']}", "url": block["url"]}])
+    if include_reference_button:
+        buttons.insert(0, [{"text": "Goodreturns rate", "url": reference_url}])
+    if buttons:
+        all_sent = send(chunk, buttons) and all_sent
     return all_sent
 
 
@@ -374,11 +400,14 @@ def parse_items(doc):
             sku = var.get("skuId")
             if not sku or offer is None:
                 continue
+            product_id = it.get("productId") or it.get("product_id") or it.get("id") or ""
+            spin_id = var.get("spinId") or ""
             full = var.get("displayName") or name
             if not all(w in (full + " " + (brand or var.get("brandName", ""))).lower() for w in WORDS):
                 continue
             stock = bool(it.get("inStock")) and bool((var.get("inventory") or {}).get("inStock", True))
-            found.setdefault(full, {"name": full, "sku": sku, "price": offer, "mrp": mrp, "in_stock": stock})
+            found.setdefault(full, {"name": full, "sku": sku, "product_id": str(product_id), "spin_id": str(spin_id),
+                                    "price": offer, "mrp": mrp, "in_stock": stock})
     return found
 
 
@@ -435,19 +464,24 @@ def goodreturns_24k_rate():
     return None
 
 
-def instamart_links(pod):
+def instamart_url(pod, items, product_name=None):
+    """Return a clean HTTPS item link that Swiggy can route through its phone app."""
+    candidates = []
+    if product_name and product_name in items:
+        candidates.append(items[product_name])
+    candidates.extend(item for name, item in items.items() if name != product_name)
+    product_id = next((item.get("product_id") for item in candidates if item.get("product_id")), "")
+    if product_id:
+        query = urllib.parse.urlencode({"storeId": pod, "primaryStoreId": pod}) if pod else ""
+        return f"https://www.swiggy.com/instamart/item/{urllib.parse.quote(product_id)}" + (f"?{query}" if query else "")
+    spin_id = next((item.get("spin_id") for item in candidates if item.get("spin_id")), "")
+    if spin_id:
+        query = urllib.parse.urlencode({"storeId": pod, "primaryStoreId": pod}) if pod else ""
+        return f"https://www.swiggy.com/instamart/p/{urllib.parse.quote(spin_id)}" + (f"?{query}" if query else "")
     fields = {"query": QUERY}
     if pod:
         fields.update({"storeId": pod, "primaryStoreId": pod})
-    params = urllib.parse.urlencode(fields)
-    web_url = f"{SWIGGY_WEB}?{params}"
-    app_url = f"swiggy://instamart/search?{params}"
-    fallback = urllib.parse.quote(web_url, safe="")
-    android_intent = (f"intent://instamart/search?{params}#Intent;scheme=swiggy;"
-                      f"package=in.swiggy.android;S.browser_fallback_url={fallback};end")
-    return (f"Android app: {android_intent}\n"
-            f"iPhone app: {app_url}\n"
-            f"App/web fallback: {web_url}")
+    return f"{SWIGGY_WEB}?{urllib.parse.urlencode(fields)}"
 
 
 def benchmark_comparison(item, gold_rate):
@@ -587,9 +621,8 @@ def check_city(city, state, inventory_report=None):
 
 def gold_reference_line(rate):
     if rate is None:
-        return f"Goodreturns Mumbai 24K/999 rate unavailable · {GOODRETURNS_URL}"
-    return (f"Goodreturns Mumbai 24K/999: {inr(rate)}/g (indicative; excludes taxes)\n"
-            f"{GOODRETURNS_URL}")
+        return "Goodreturns Mumbai 24K/999 rate unavailable"
+    return f"Goodreturns Mumbai 24K/999: {inr(rate)}/g (indicative; excludes taxes)"
 
 
 def format_inventory(report, gold_rate):
@@ -597,7 +630,7 @@ def format_inventory(report, gold_rate):
     for city in report:
         label, pod, items = city["label"], city.get("pod", ""), city.get("items", {})
         if city.get("error"):
-            lines = [f"📍 {label} · scan failed: {city['error']}"]
+            lines = [f"📍 {label} · scan failed"]
         else:
             lines = [f"📍 {label} · {len(items)} available coin(s)"]
         if items and not city.get("error"):
@@ -605,10 +638,9 @@ def format_inventory(report, gold_rate):
                 lines.append(f"• {short(name)} — {inr(item['price'])}{benchmark_comparison(item, gold_rate)}")
         elif not city.get("error"):
             lines.append("No in-stock Kalyan coins")
-        lines.append(instamart_links(pod))
-        blocks.append("\n".join(lines))
-    return ("📋 Kalyan gold coin inventory · initial check\n" + gold_reference_line(gold_rate)
-            + "\n\n" + "\n\n".join(blocks))
+        blocks.append({"label": label, "text": "\n".join(lines), "url": instamart_url(pod, items)})
+    return {"title": "📋 Kalyan coin inventory · initial check",
+            "reference": gold_reference_line(gold_rate), "blocks": blocks}
 
 
 def format_price_updates(changes, gold_rate):
@@ -623,10 +655,11 @@ def format_price_updates(changes, gold_rate):
             item = city["current"].get(name, {"name": name, "price": current_price})
             lines.append(f"{icon} {short(name)}\n   {inr(previous)} → {inr(current_price)} "
                          f"({sign}{inr(abs(diff))} | {pct:+.1f}%){benchmark_comparison(item, gold_rate)}")
-        lines.append(instamart_links(city.get("pod", "")))
-        blocks.append("\n".join(lines))
-    return ("💰 Kalyan coin price update\n" + gold_reference_line(gold_rate)
-            + "\n\n" + "\n\n".join(blocks))
+        first_changed = city["changed"][0][0] if city["changed"] else None
+        blocks.append({"label": city["label"], "text": "\n".join(lines),
+                       "url": instamart_url(city.get("pod", ""), city["current"], first_changed)})
+    return {"title": "💰 Kalyan coin price update",
+            "reference": gold_reference_line(gold_rate), "blocks": blocks}
 
 
 def main():
@@ -644,19 +677,24 @@ def main():
     # buggy version already wrote its older marker into the shared state file.
     inventory_pending = not (state.get("_tracker_meta") or {}).get("initial_inventory_v2_sent", False)
     meta = state.get("_tracker_meta") if isinstance(state.get("_tracker_meta"), dict) else {}
-    initial_gap = max(MIN_CITY_GAP_SEC, min(45, INTERVAL // max(1, len(cities))))
+    initial_gap = max(MIN_CITY_GAP_SEC, min(20, INTERVAL // max(1, len(cities))))
     try:
-        gap = max(MIN_CITY_GAP_SEC, min(300, int(meta.get("city_gap_sec", initial_gap))))
-        safe_gap = max(MIN_CITY_GAP_SEC, min(300, int(meta.get("safe_city_gap_sec", gap))))
-        pace_hold = max(0, int(meta.get("pace_hold_rounds", 0)))
+        policy = int(meta.get("pace_policy_version", 0))
+        if policy == 3:
+            gap = max(MIN_CITY_GAP_SEC, min(300, int(meta.get("city_gap_sec", initial_gap))))
+            safe_gap = max(MIN_CITY_GAP_SEC, min(300, int(meta.get("safe_city_gap_sec", gap))))
+            pace_hold = max(0, int(meta.get("pace_hold_rounds", 0)))
+        else:
+            gap, safe_gap, pace_hold = initial_gap, initial_gap, 0
     except (TypeError, ValueError):
         gap, safe_gap, pace_hold = initial_gap, initial_gap, 0
     log(f"{'TEST (nothing sent or saved)' if DRY else 'Tracking'}: '{QUERY}' in {len(cities)} cities; "
-        f"starting city gap {gap}s, adaptively tuning after clean rounds. State: {STATE_FILE}")
+        f"starting city gap {gap}s; round target {INTERVAL}s. State: {STATE_FILE}")
     if TOKEN and not DRY and os.environ.get("ENABLE_COMMANDS", "1") != "0":
         threading.Thread(target=command_loop, daemon=True).start()
     streak = 0
     while True:
+        round_started = time.monotonic()
         sections = []
         inventory_report = [] if inventory_pending else None
         rate_limited = False
@@ -705,7 +743,8 @@ def main():
                 time.sleep((gap + extra) * random.uniform(0.9, 1.1))
         if inventory_report is not None:
             rate = goodreturns_24k_rate()
-            sent = send_long(format_inventory(inventory_report, rate))
+            report = format_inventory(inventory_report, rate)
+            sent = send_city_report(report["title"], report["reference"], report["blocks"])
             # Disarm this process after one attempt so a failed Telegram send cannot spam each round.
             inventory_report = None
             inventory_pending = False
@@ -714,7 +753,8 @@ def main():
                 save_state(state)
         if sections:
             rate = goodreturns_24k_rate()
-            send_long(format_price_updates(sections, rate))
+            report = format_price_updates(sections, rate)
+            send_city_report(report["title"], report["reference"], report["blocks"])
         if DRY:
             log("Test round finished.")
             return
@@ -740,8 +780,13 @@ def main():
         meta["city_gap_sec"] = next_gap
         meta["safe_city_gap_sec"] = safe_gap
         meta["pace_hold_rounds"] = pace_hold
+        meta["pace_policy_version"] = 3
         save_state(state)
         gap = next_gap
+        remaining = INTERVAL - (time.monotonic() - round_started)
+        if remaining > 0:
+            log(f"Waiting about {int(remaining)}s to keep the full-round interval at {INTERVAL}s")
+            time.sleep(remaining)
 
 
 if __name__ == "__main__":
