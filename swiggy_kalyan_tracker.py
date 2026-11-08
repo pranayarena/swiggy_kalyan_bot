@@ -18,7 +18,9 @@ Env vars (or a .env file next to this script):
   TELEGRAM_ADMIN_ID    optional: your numeric Telegram user id(s), comma separated, allowed to use /status
   LOCATIONS            optional: "Label=search text;Label2=search text2". Search text can be an area,
                        "pincode city" or an address. Default list: see DEFAULT_LOCATIONS below.
-  CHECK_INTERVAL_SEC   seconds for one full round over all cities, default 300, minimum 60
+  CHECK_INTERVAL_SEC   seconds between rounds over all cities, default 120, minimum 30
+  REQUEST_GAP_SEC      pause between single Instamart calls, default 1.5, minimum 1
+  INITIAL_REPORT       default 1 = first message after start is a full stock check of every city
   SEARCH_QUERY         default "kalyan gold coin"
   TRACK_WORDS          comma list, ALL must appear in item name+brand. default "kalyan,gold coin"
   STATE_FILE           default kalyan_state_cities.json (lost on restart on hosts without a disk)
@@ -26,6 +28,7 @@ Env vars (or a .env file next to this script):
   NOTIFY_ERRORS        default 0 = Telegram gets ONLY price changes and new SKUs. 1 = also failure warnings.
 """
 import gzip
+import html
 import http.cookiejar
 import json
 import os
@@ -81,9 +84,16 @@ STATE_FILE = os.environ.get("STATE_FILE", os.path.join(HERE, "kalyan_state_citie
 BUILD = os.environ.get("X_BUILD_VERSION", "2.392.0").strip()
 NOTIFY_ERRORS = os.environ.get("NOTIFY_ERRORS", "0").strip() == "1"
 try:
-    INTERVAL = max(60, int(os.environ.get("CHECK_INTERVAL_SEC", "300")))
+    INTERVAL = max(30, int(os.environ.get("CHECK_INTERVAL_SEC", "120")))
 except ValueError:
-    INTERVAL = 300
+    INTERVAL = 120
+try:
+    BASE_GAP = max(1.0, float(os.environ.get("REQUEST_GAP_SEC", "1.5")))
+except ValueError:
+    BASE_GAP = 1.5
+MAX_SCALE = 16.0  # slowest the tracker will ever go: 16x its normal pace
+INITIAL_REPORT = os.environ.get("INITIAL_REPORT", "1").strip() != "0"
+LINK = BASE + "/search?query=" + urllib.parse.quote(QUERY)  # opens the Swiggy app on a phone
 DRY = "--once" in sys.argv  # dry run: print only, send nothing, save nothing
 
 
@@ -114,28 +124,29 @@ def tg_api(method, payload=None, timeout=20):
 
 def send(text):
     if DRY or not TOKEN or not CHAT_ID:
-        log("ALERT (not sent): " + text.replace("\n", " | "))
+        log("MESSAGE (not sent):\n" + text)
         return
-    log("ALERT sent: " + text.split("\n")[0])
+    log("MESSAGE sent: " + text.split("\n")[0])
     for _ in range(2):
         try:
-            tg_api("sendMessage", {"chat_id": CHAT_ID, "text": text, "disable_web_page_preview": True})
+            tg_api("sendMessage", {"chat_id": CHAT_ID, "text": text, "parse_mode": "HTML",
+                                   "disable_web_page_preview": True})
             return
         except Exception as e:  # noqa: BLE001
             log(f"Telegram send failed ({e})")
             time.sleep(3)
 
 
-def send_long(text):
-    """Telegram allows 4096 characters per message: split on line breaks if needed."""
-    chunk = ""
-    for line in text.split("\n"):
-        if len(chunk) + len(line) + 1 > 3800:
-            send(chunk)
-            chunk = ""
-        chunk += ("\n" if chunk else "") + line
-    if chunk:
-        send(chunk)
+def send_blocks(header, blocks, footer=""):
+    """Send header + city blocks, splitting between blocks so no message passes Telegram's 4096 limit."""
+    msg = header
+    for blk in blocks + ([footer] if footer else []):
+        if len(msg) + len(blk) + 2 > 3800:
+            send(msg)
+            msg = ""
+        msg += ("\n\n" if msg else "") + blk
+    if msg:
+        send(msg)
 
 
 def get_chat_id():
@@ -156,6 +167,33 @@ def get_chat_id():
 # ---------- Instamart ----------
 class Blocked(Exception):
     """Instamart refused: 429 rate limit, 403/405 bot check, empty or non-JSON reply."""
+    limited = False
+
+
+class Pacer:
+    """Spaces every Instamart call. A 429 doubles the pause (up to 16x); every good call eases it back."""
+
+    def __init__(self):
+        self.scale, self.last = 1.0, 0.0
+
+    def wait(self):
+        gap = BASE_GAP * self.scale * random.uniform(0.9, 1.2)
+        time.sleep(max(0.0, self.last + gap - time.time()))
+        self.last = time.time()
+
+    def hit(self):
+        old, self.scale = self.scale, min(self.scale * 2, MAX_SCALE)
+        if self.scale != old:
+            log(f"429 too many requests -> slowing down: {BASE_GAP * self.scale:.1f}s between calls, "
+                f"{INTERVAL * self.scale:.0f}s between rounds")
+
+    def ok(self):
+        old, self.scale = self.scale, max(1.0, self.scale * 0.92)
+        if old > 1.0 and self.scale == 1.0:
+            log("Instamart is happy again -> back to normal speed")
+
+
+PACER = Pacer()
 
 
 class NoPlace(Exception):
@@ -221,42 +259,52 @@ class City:
         if payload is not None:
             data = json.dumps(payload).encode()
             headers["Content-Type"] = "application/json"
+        PACER.wait()
         status, text = self._fetch(urllib.request.Request(url, data=data, method=method, headers=headers))
         if status in (403, 405, 429) or status >= 500:
-            raise Blocked(f"HTTP {status}")
+            e = Blocked(f"HTTP {status}")
+            e.limited = status == 429
+            if e.limited:
+                PACER.hit()
+            raise e
         try:
             doc = json.loads(text)
         except json.JSONDecodeError:
             raise Blocked(f"HTTP {status}, " + ("empty reply" if not text.strip() else f"not JSON: {text[:60]!r}"))
         if isinstance(doc, dict) and doc.get("statusCode") == 429:
-            raise Blocked("rate limited (429)")
+            e = Blocked("rate limited (429)")
+            e.limited = True
+            PACER.hit()
+            raise e
+        PACER.ok()
         return doc
 
     def setup(self):
         """Do what the website does: open the site, search the place, read its coordinates, select it."""
+        PACER.wait()
         status, _ = self._fetch(urllib.request.Request(BASE + "/", headers={
             "User-Agent": UA, "Accept": "text/html,*/*;q=0.8", "Accept-Encoding": "gzip"}))
         if status in (403, 405, 429):
-            raise Blocked(f"home page HTTP {status}")
-        time.sleep(random.uniform(1.0, 2.0))
+            e = Blocked(f"home page HTTP {status}")
+            e.limited = status == 429
+            if e.limited:
+                PACER.hit()
+            raise e
         found = self._call("GET", BASE + "/api/instamart/maps/suggestions?input=" + urllib.parse.quote(self.text))
         places = found.get("data") or []
         if not places:
             raise NoPlace(f"no place found for '{self.text}'")
-        time.sleep(random.uniform(1.0, 2.0))
         info = self._call("GET", BASE + "/api/instamart/maps/address-widgets/v2?place_id="
                           + urllib.parse.quote(places[0]["place_id"]))
         addr = (info.get("data") or {}).get("address") or {}
         loc = addr.get("location") or {}
         if "latitude" not in loc:
             raise Blocked("place details had no coordinates")
-        time.sleep(random.uniform(1.0, 2.0))
         self._call("POST", BASE + "/api/instamart/home/select-location/v2", {"data": {
             "lat": loc["latitude"], "lng": loc["longitude"], "address": addr.get("subtitle", ""), "addressId": "",
             "annotation": addr.get("subtitle", ""), "clientId": "INSTAMART-APP"}})
         self.address = addr.get("subtitle", "")
         self.ready = True
-        time.sleep(random.uniform(2.0, 4.0))
 
     def search(self):
         if not self.ready:
@@ -356,23 +404,52 @@ def short(name):
     return name.replace("Kalyan Jewellers ", "").strip()
 
 
+def esc(t):
+    return html.escape(str(t), quote=False)
+
+
+def link_line():
+    return f'🔗 <a href="{LINK}">Open in Swiggy</a>'
+
+
 def compare_city(old, current):
-    """Update `old` (this city's saved coins). Return (changed lines, new-coin lines)."""
+    """Update `old` (this city's saved coins). Return alert lines for changed prices and new coins."""
     had_state = bool(old)  # the first scan of a city only saves a baseline
-    changed, new = [], []
+    lines = []
     for name, cur in current.items():
         prev = old.get(name)
         if prev is None:
             if had_state:
-                new.append(f"🆕 NEW: {short(name)}\n    {inr(cur['price'])} (MRP {inr(cur['mrp'] or 0)})")
+                lines.append(f"🆕 <b>{esc(short(name))}</b>  {inr(cur['price'])}  (new listing)")
         elif cur["price"] != prev["price"]:
             diff = cur["price"] - prev["price"]
             pct = diff / prev["price"] * 100 if prev["price"] else 0
-            sign = "+" if diff > 0 else "-"
-            changed.append(f"{'🔺' if diff > 0 else '🔻'} {short(name)}\n    {inr(prev['price'])} → {inr(cur['price'])}  "
-                           f"({sign}{inr(abs(diff))} | {pct:+.1f}%)")
+            lines.append(f"{'🔺' if diff > 0 else '🔻'} <b>{esc(short(name))}</b>\n"
+                         f"      {inr(prev['price'])} → {inr(cur['price'])}   "
+                         f"<b>{'+' if diff > 0 else '-'}{inr(abs(diff))}</b> ({pct:+.1f}%)")
         old[name] = cur
-    return changed, new
+    return lines
+
+
+def stamp():
+    return datetime.now(IST).strftime("%d %b, %I:%M %p IST")
+
+
+def inventory_report(labels):
+    """First message: stock of every coin in every city."""
+    blocks = []
+    for label in labels:
+        items, err = STATE.get(label, {}), STATUS[label].get("error")
+        if items:
+            n_in = sum(1 for d in items.values() if d["in_stock"])
+            rows = [f"{'✅' if d['in_stock'] else '⛔'} {esc(short(n))} — {inr(d['price'])}"
+                    for n, d in sorted(items.items(), key=lambda kv: kv[1]["price"])]
+            blocks.append(f"📍 <b>{esc(label)}</b> · {n_in}/{len(items)} in stock\n" + "\n".join(rows) + "\n" + link_line())
+        elif err and not STATUS[label].get("ok"):
+            blocks.append(f"📍 <b>{esc(label)}</b>\n⚠️ could not check yet ({esc(err[:50])})")
+        else:
+            blocks.append(f"📍 <b>{esc(label)}</b>\nNo Kalyan coins listed here")
+    return blocks
 
 
 # ---------- /status command ----------
@@ -416,6 +493,7 @@ def status_text(arg=""):
         else:
             lines.append(f"📍 {label}: no coins listed{when}{err}")
     if not arg:
+        lines.append(f"⏱ every {INTERVAL * PACER.scale:.0f}s" + (" (slowed: Instamart rate limit)" if PACER.scale > 1.05 else ""))
         lines.append("Details: /status <city>")
     return "\n".join(lines)
 
@@ -458,72 +536,71 @@ def command_loop():
 
 # ---------- main loop ----------
 def check_city(city, state):
-    """One search for one city. Returns that city's alert section, or None."""
-    doc = city.search()
+    """One search for one city. Returns alert lines (possibly empty)."""
+    for attempt in (1, 2):
+        try:
+            doc = city.search()
+            break
+        except Blocked as e:
+            if not (e.limited and attempt == 1):
+                raise
+            time.sleep(5 * PACER.scale)  # 429: cool off once, then try the same city again
     current = parse_items(doc)
     pod = first_pod(doc)
     STATUS[city.label] = {"ok": time.time(), "pod": pod, "error": ""}
-    old = state.setdefault(city.label, {})
+    lines = compare_city(state.setdefault(city.label, {}), current)
     if DRY:
         coins = ", ".join(f"{short(n)} {inr(d['price'])}{'' if d['in_stock'] else ' (out)'}" for n, d in sorted(current.items()))
         log(f"{city.label}: store {pod or '?'} · {city.address} · {len(current)} coins" + (f": {coins}" if coins else ""))
-        return None
-    if not current:
-        log(f"{city.label}: store {pod or '?'} · no Kalyan coins listed")
-        return None
-    changed, new = compare_city(old, current)
-    log(f"{city.label}: store {pod or '?'} · {len(current)} coins" + (f" · {len(changed)} price change(s), {len(new)} new" if changed or new else ""))
-    return f"📍 {city.label}\n" + "\n".join(changed + new) if (changed or new) else None
+    else:
+        log(f"{city.label}: store {pod or '?'} · {len(current)} coins" + (f" · {len(lines)} change(s)" if lines else ""))
+    return lines
 
 
 def main():
     if "--get-chat-id" in sys.argv:
         return get_chat_id()
-    locations = parse_locations()
-    cities = [City(label, text) for label, text in locations]
+    cities = [City(label, text) for label, text in parse_locations()]
+    labels = [c.label for c in cities]
     state = {} if DRY else load_state()
-    STATE.update(state)
-    STATE.clear()
     STATE.update(state)
     for c in cities:
         STATUS[c.label] = {"ok": None, "pod": "", "error": ""}
-    log(f"{'TEST (nothing sent or saved)' if DRY else 'Tracking'}: '{QUERY}' in {len(cities)} cities, one full round about every "
-        f"{INTERVAL}s. Plain HTTP, no browser. State: {STATE_FILE}")
+    log(f"{'TEST (nothing sent or saved)' if DRY else 'Tracking'}: '{QUERY}' in {len(cities)} cities. Plain HTTP, no browser. "
+        f"Round every {INTERVAL}s, {BASE_GAP}s between calls (auto-slows on 429). State: {STATE_FILE}")
     if TOKEN and not DRY and os.environ.get("ENABLE_COMMANDS", "1") != "0":
         threading.Thread(target=command_loop, daemon=True).start()
-    gap = max(20, INTERVAL // max(1, len(cities)))
-    streak = 0
+    first, streak = True, 0
     while True:
-        sections = []
+        started, blocks = time.time(), []
         for city in cities:
             try:
-                section = check_city(city, state)
-                if section:
-                    sections.append(section)
+                lines = check_city(city, state)
+                if lines:
+                    blocks.append(f"📍 <b>{esc(city.label)}</b>\n" + "\n".join(lines) + "\n" + link_line())
                 streak = 0
-            except (Blocked, NoPlace) as e:
+            except Exception as e:  # noqa: BLE001
                 city.reset()  # start this city from scratch next round
                 streak += 1
-                STATUS[city.label]["error"] = str(e)
-                log(f"{city.label}: failed ({e})")
-            except Exception as e:  # noqa: BLE001
-                city.reset()
-                streak += 1
-                STATUS[city.label]["error"] = f"{type(e).__name__}: {e}"
-                log(f"{city.label}: failed ({type(e).__name__}: {e})")
-            save_state(state)
+                msg = str(e) if isinstance(e, (Blocked, NoPlace)) else f"{type(e).__name__}: {e}"
+                STATUS[city.label]["error"] = msg
+                log(f"{city.label}: failed ({msg})")
+                if streak >= 3 and streak % 6 == 3 and NOTIFY_ERRORS:
+                    send(f"⚠️ Tracker: {streak} failed checks in a row. Last: {esc(msg)}")
             STATE.clear()
             STATE.update(state)
-            extra = min(30 * 2 ** (streak - 1), 600) if streak >= 3 else 0  # several failures in a row: slow down
-            if streak >= 3 and streak % 6 == 3 and NOTIFY_ERRORS:
-                send(f"⚠️ Tracker: {streak} failed checks in a row. Last: {STATUS[city.label]['error']}")
-            time.sleep((gap + extra) * random.uniform(0.9, 1.1))
-        if sections:
-            send_long("💰 Kalyan gold coin update\n" + "\n".join(sections) + "\n" + BASE + "/search?query="
-                      + urllib.parse.quote(QUERY))
+        save_state(state)
+        if first and INITIAL_REPORT:
+            send_blocks(f"📦 <b>Kalyan gold coins · stock check</b>\n🕒 {stamp()} · {len(cities)} cities",
+                        inventory_report(labels),
+                        "From now on: quiet checks. You only hear about price changes 🔺🔻 and new listings 🆕.")
+        elif blocks:
+            send_blocks(f"💰 <b>Kalyan gold coin update</b> · {stamp()}", blocks)
+        first = False
         if DRY:
             log("Test round finished.")
             return
+        time.sleep(max(5.0, INTERVAL * PACER.scale - (time.time() - started)) * random.uniform(0.95, 1.05))
 
 
 if __name__ == "__main__":
