@@ -19,6 +19,7 @@ Env vars (or a .env file next to this script):
   LOCATIONS            optional: "Label=search text;Label2=search text2". Search text can be an area,
                        "pincode city" or an address. Default list: see DEFAULT_LOCATIONS below.
   CHECK_INTERVAL_SEC   seconds between full rounds, default 900, minimum 600
+  MIN_CITY_GAP_SEC     floor for adaptive city pacing, default 20
   SEARCH_QUERY         default "kalyan gold coin"
   TRACK_WORDS          comma list, ALL must appear in item name+brand. default "kalyan,gold coin"
   STATE_FILE           default kalyan_state_cities.json (lost on restart on hosts without a disk)
@@ -89,6 +90,11 @@ try:
     INTERVAL = max(600, int(os.environ.get("CHECK_INTERVAL_SEC", "900")))
 except ValueError:
     INTERVAL = 900
+try:
+    MIN_CITY_GAP_SEC = max(15, int(os.environ.get("MIN_CITY_GAP_SEC", "20")))
+except ValueError:
+    MIN_CITY_GAP_SEC = 20
+PACE_STEP_SEC = 5
 DRY = "--once" in sys.argv  # dry run: print only, send nothing, save nothing
 RATE_LIMIT_UNTIL = 0.0
 RATE_LIMIT_STREAK = 0
@@ -434,8 +440,14 @@ def instamart_links(pod):
     if pod:
         fields.update({"storeId": pod, "primaryStoreId": pod})
     params = urllib.parse.urlencode(fields)
-    return (f"App: swiggy://instamart/search?{params}\n"
-            f"Web: {SWIGGY_WEB}?{params}")
+    web_url = f"{SWIGGY_WEB}?{params}"
+    app_url = f"swiggy://instamart/search?{params}"
+    fallback = urllib.parse.quote(web_url, safe="")
+    android_intent = (f"intent://instamart/search?{params}#Intent;scheme=swiggy;"
+                      f"package=in.swiggy.android;S.browser_fallback_url={fallback};end")
+    return (f"Android app: {android_intent}\n"
+            f"iPhone app: {app_url}\n"
+            f"App/web fallback: {web_url}")
 
 
 def benchmark_comparison(item, gold_rate):
@@ -631,16 +643,24 @@ def main():
     # Versioned key lets the new clean snapshot send once even if the previous
     # buggy version already wrote its older marker into the shared state file.
     inventory_pending = not (state.get("_tracker_meta") or {}).get("initial_inventory_v2_sent", False)
-    log(f"{'TEST (nothing sent or saved)' if DRY else 'Tracking'}: '{QUERY}' in {len(cities)} cities, one full round about every "
-        f"{INTERVAL}s. Plain HTTP, no browser. State: {STATE_FILE}")
+    meta = state.get("_tracker_meta") if isinstance(state.get("_tracker_meta"), dict) else {}
+    initial_gap = max(MIN_CITY_GAP_SEC, min(45, INTERVAL // max(1, len(cities))))
+    try:
+        gap = max(MIN_CITY_GAP_SEC, min(300, int(meta.get("city_gap_sec", initial_gap))))
+        safe_gap = max(MIN_CITY_GAP_SEC, min(300, int(meta.get("safe_city_gap_sec", gap))))
+        pace_hold = max(0, int(meta.get("pace_hold_rounds", 0)))
+    except (TypeError, ValueError):
+        gap, safe_gap, pace_hold = initial_gap, initial_gap, 0
+    log(f"{'TEST (nothing sent or saved)' if DRY else 'Tracking'}: '{QUERY}' in {len(cities)} cities; "
+        f"starting city gap {gap}s, adaptively tuning after clean rounds. State: {STATE_FILE}")
     if TOKEN and not DRY and os.environ.get("ENABLE_COMMANDS", "1") != "0":
         threading.Thread(target=command_loop, daemon=True).start()
-    gap = max(60, INTERVAL // max(1, len(cities)))
     streak = 0
     while True:
         sections = []
         inventory_report = [] if inventory_pending else None
         rate_limited = False
+        round_had_429 = False
         for city_index, city in enumerate(cities):
             try:
                 section = check_city(city, state, inventory_report)
@@ -648,8 +668,9 @@ def main():
                     sections.append(section)
                 streak = 0
             except RateLimited as e:
-                # Do not rebuild the session or continue querying other cities after a 429.
+                # Keep the session, pause, then continue with the next city.
                 streak += 1
+                round_had_429 = True
                 STATUS[city.label]["error"] = str(e)
                 log(f"{city.label}: failed ({e})")
                 if inventory_report is not None:
@@ -674,11 +695,15 @@ def main():
             STATE.clear()
             STATE.update(state)
             if rate_limited:
-                break
+                # Keep the initial report moving: wait out this city's 429, then
+                # attempt the remaining cities instead of restarting the round.
+                wait_out_rate_limit()
+                rate_limited = False
+                continue
             extra = min(30 * 2 ** (streak - 1), 600) if streak >= 3 else 0  # several failures in a row: slow down
-            if city_index < len(cities) - 1 or not DRY:
+            if city_index < len(cities) - 1 or (not DRY and not inventory_pending):
                 time.sleep((gap + extra) * random.uniform(0.9, 1.1))
-        if inventory_report is not None and not rate_limited:
+        if inventory_report is not None:
             rate = goodreturns_24k_rate()
             sent = send_long(format_inventory(inventory_report, rate))
             # Disarm this process after one attempt so a failed Telegram send cannot spam each round.
@@ -693,8 +718,30 @@ def main():
         if DRY:
             log("Test round finished.")
             return
-        if rate_limited:
-            wait_out_rate_limit()
+        meta = state.setdefault("_tracker_meta", {})
+        if round_had_429:
+            if gap < safe_gap:
+                next_gap = safe_gap
+                log(f"429 at trial gap {gap}s; reverting to last clean gap {safe_gap}s and holding pace")
+            else:
+                next_gap = min(300, gap + 15)
+                safe_gap = next_gap
+                log(f"429 at stable gap {gap}s; increasing city gap to {next_gap}s")
+            pace_hold = 3
+        elif pace_hold > 0:
+            pace_hold -= 1
+            next_gap = gap
+            log(f"Clean round; holding city gap at {gap}s for {pace_hold} more round(s)")
+        else:
+            safe_gap = gap
+            next_gap = max(MIN_CITY_GAP_SEC, gap - PACE_STEP_SEC)
+            if next_gap < gap:
+                log(f"Clean round; cautiously reducing city gap from {gap}s to {next_gap}s")
+        meta["city_gap_sec"] = next_gap
+        meta["safe_city_gap_sec"] = safe_gap
+        meta["pace_hold_rounds"] = pace_hold
+        save_state(state)
+        gap = next_gap
 
 
 if __name__ == "__main__":
