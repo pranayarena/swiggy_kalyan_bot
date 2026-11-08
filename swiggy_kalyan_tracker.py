@@ -18,8 +18,8 @@ Env vars (or a .env file next to this script):
   TELEGRAM_ADMIN_ID    optional: your numeric Telegram user id(s), comma separated, allowed to use /status
   LOCATIONS            optional: "Label=search text;Label2=search text2". Search text can be an area,
                        "pincode city" or an address. Default list: see DEFAULT_LOCATIONS below.
-  CHECK_INTERVAL_SEC   seconds between rounds over all cities, default 300, minimum 30
-  REQUEST_GAP_SEC      pause between single Instamart calls, default 3, minimum 1
+  CHECK_INTERVAL_SEC   seconds between rounds over all cities, default 120, minimum 30
+  REQUEST_GAP_SEC      pause between single Instamart calls, default 1.5, minimum 1
   INITIAL_REPORT       default 1 = one stock-check message on a start with no saved state. Set 0 on Voroa after the first deploy (no disk, state resets)
   SEARCH_QUERY         default "kalyan gold coin"
   TRACK_WORDS          comma list, ALL must appear in item name+brand. default "kalyan,gold coin"
@@ -87,14 +87,14 @@ STATE_FILE = os.environ.get("STATE_FILE", os.path.join(HERE, "kalyan_state_pins.
 BUILD = os.environ.get("X_BUILD_VERSION", "2.392.0").strip()
 NOTIFY_ERRORS = os.environ.get("NOTIFY_ERRORS", "0").strip() == "1"
 try:
-    INTERVAL = max(30, int(os.environ.get("CHECK_INTERVAL_SEC", "300")))
+    INTERVAL = max(30, int(os.environ.get("CHECK_INTERVAL_SEC", "120")))
 except ValueError:
-    INTERVAL = 300
+    INTERVAL = 120
 try:
-    BASE_GAP = max(1.0, float(os.environ.get("REQUEST_GAP_SEC", "3")))
+    BASE_GAP = max(1.0, float(os.environ.get("REQUEST_GAP_SEC", "1.5")))
 except ValueError:
-    BASE_GAP = 3.0
-MAX_SCALE = 6.0  # slowest the tracker will ever go: 6x its normal pace
+    BASE_GAP = 1.5
+MAX_SCALE = 16.0  # slowest the tracker will ever go: 16x its normal pace
 INITIAL_REPORT = os.environ.get("INITIAL_REPORT", "1").strip() != "0"
 LINK = BASE + "/search?query=" + urllib.parse.quote(QUERY)  # opens the Swiggy app on a phone
 DRY = "--once" in sys.argv  # dry run: print only, send nothing, save nothing
@@ -195,7 +195,7 @@ class Blocked(Exception):
 
 
 class Pacer:
-    """Spaces every Instamart call. A 429 raises the pause 1.5x (up to 6x); every good call eases it back."""
+    """Spaces every Instamart call. A 429 doubles the pause (up to 16x); every good call eases it back."""
 
     def __init__(self):
         self.scale, self.last = 1.0, 0.0
@@ -206,13 +206,13 @@ class Pacer:
         self.last = time.time()
 
     def hit(self):
-        old, self.scale = self.scale, min(self.scale * 1.5, MAX_SCALE)
+        old, self.scale = self.scale, min(self.scale * 2, MAX_SCALE)
         if self.scale != old:
             log(f"429 too many requests -> slowing down: {BASE_GAP * self.scale:.1f}s between calls, "
                 f"{INTERVAL * self.scale:.0f}s between rounds")
 
     def ok(self):
-        old, self.scale = self.scale, max(1.0, self.scale * 0.97)
+        old, self.scale = self.scale, max(1.0, self.scale * 0.92)
         if old > 1.0 and self.scale == 1.0:
             log("Instamart is happy again -> back to normal speed")
 
