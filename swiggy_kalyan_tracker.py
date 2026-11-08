@@ -20,10 +20,10 @@ Env vars (or a .env file next to this script):
                        "pincode city" or an address. Default list: see DEFAULT_LOCATIONS below.
   CHECK_INTERVAL_SEC   seconds between rounds over all cities, default 120, minimum 30
   REQUEST_GAP_SEC      pause between single Instamart calls, default 1.5, minimum 1
-  INITIAL_REPORT       default 1 = first message after start is a full stock check of every city
+  INITIAL_REPORT       default 1 = one stock-check message on a start with no saved state. Set 0 on Voroa after the first deploy (no disk, state resets)
   SEARCH_QUERY         default "kalyan gold coin"
   TRACK_WORDS          comma list, ALL must appear in item name+brand. default "kalyan,gold coin"
-  STATE_FILE           default kalyan_state_cities.json (lost on restart on hosts without a disk)
+  STATE_FILE           default kalyan_state_pins.json (lost on restart on hosts without a disk)
   ENABLE_COMMANDS      default 1 = answer /status. Use 0 on a second copy (PC + Voroa) to avoid clashes.
   NOTIFY_ERRORS        default 0 = Telegram gets ONLY price changes and new SKUs. 1 = also failure warnings.
 """
@@ -32,6 +32,7 @@ import html
 import http.cookiejar
 import json
 import os
+import re
 import random
 import sys
 import threading
@@ -49,14 +50,15 @@ UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like
       "Chrome/157.0.0.0 Safari/537.36")
 IST = timezone(timedelta(hours=5, minutes=30))
 
-# Tier 1 and tier 2 cities. Instamart does not serve every one of them; a city with no store just shows
-# "0 coins" in /status. Replace with your own areas or pincodes through the LOCATIONS variable.
+# Tier 1 and tier 2 cities, a few pincodes each. A pincode can map to a store that has nothing in stock while the
+# next one has plenty, so each city gets several. Pincodes that map to the SAME store are detected on the first round
+# and dropped automatically. Instamart does not serve every city; that city just shows "no coins listed".
+# Override with LOCATIONS="City=pin1,pin2;City2=pin"  (a pincode, area or address, anything the site search accepts).
 DEFAULT_LOCATIONS = (
-    "Mumbai=Andheri West, Mumbai;Pune=Koregaon Park, Pune;Nashik=Nashik Road;"
-    "Bengaluru=Koramangala, Bengaluru;Chennai=T Nagar, Chennai;Hyderabad=Banjara Hills, Hyderabad;"
-    "Delhi=Connaught Place, New Delhi;Kolkata=Salt Lake, Kolkata;Ahmedabad=Satellite, Ahmedabad;"
-    "Surat=Adajan, Surat;Vadodara=Alkapuri, Vadodara;Rajkot=Kalawad Road, Rajkot;"
-    "Jaipur=Malviya Nagar, Jaipur;Kochi=Edappally, Kochi"
+    "Mumbai=400053,400050,400076,400601;Pune=411001,411045,411014;Nashik=422005,422101,422002;"
+    "Bengaluru=560034,560066,560102;Chennai=600017,600042,600040;Hyderabad=500034,500081,500032;"
+    "Delhi=110001,110017,110075;Kolkata=700091,700019;Ahmedabad=380015,380054;Surat=395009,395007;"
+    "Vadodara=390007;Rajkot=360005;Jaipur=302017;Kochi=682024"
 )
 
 
@@ -80,7 +82,7 @@ CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "").strip()
 ADMIN_IDS = {x.strip() for x in os.environ.get("TELEGRAM_ADMIN_ID", "").split(",") if x.strip()}
 QUERY = os.environ.get("SEARCH_QUERY", "kalyan gold coin")
 WORDS = [w.strip().lower() for w in os.environ.get("TRACK_WORDS", "kalyan,gold coin").split(",") if w.strip()]
-STATE_FILE = os.environ.get("STATE_FILE", os.path.join(HERE, "kalyan_state_cities.json"))
+STATE_FILE = os.environ.get("STATE_FILE", os.path.join(HERE, "kalyan_state_pins.json"))
 BUILD = os.environ.get("X_BUILD_VERSION", "2.392.0").strip()
 NOTIFY_ERRORS = os.environ.get("NOTIFY_ERRORS", "0").strip() == "1"
 try:
@@ -102,14 +104,14 @@ def log(msg):
 
 
 def parse_locations():
+    """Return [(city, search text)], one entry per pincode."""
     raw = os.environ.get("LOCATIONS", "").strip() or DEFAULT_LOCATIONS
     out = []
     for part in raw.split(";"):
-        part = part.strip()
-        if not part:
-            continue
-        label, _, text = part.partition("=")
-        out.append((label.strip(), (text or label).strip()))
+        city, _, texts = part.strip().partition("=")
+        for t in (texts or city).split(","):
+            if t.strip():
+                out.append((city.strip(), t.strip()))
     return out
 
 
@@ -223,8 +225,9 @@ def make_matcher():
 class City:
     """One delivery spot: its own cookies, its own store. Rebuilt from scratch after any failure."""
 
-    def __init__(self, label, text):
-        self.label, self.text = label, text
+    def __init__(self, city, text):
+        self.city, self.text, self.label = city, text, f"{city} {text}"
+        self.pod, self.dup = "", False
         self.reset()
 
     def reset(self):
@@ -290,7 +293,7 @@ class City:
             if e.limited:
                 PACER.hit()
             raise e
-        found = self._call("GET", BASE + "/api/instamart/maps/suggestions?input=" + urllib.parse.quote(self.text))
+        found = self._call("GET", BASE + "/api/instamart/maps/suggestions?input=" + urllib.parse.quote(f"{self.text} {self.city}" if self.text.isdigit() else self.text))
         places = found.get("data") or []
         if not places:
             raise NoPlace(f"no place found for '{self.text}'")
@@ -401,7 +404,10 @@ def inr(n):
 
 
 def short(name):
-    return name.replace("Kalyan Jewellers ", "").strip()
+    """'Kalyan Jewellers Flower 24 Karat Gold Coin (1 g)' -> 'Flower 24K 1 g'"""
+    n = name.replace("Kalyan Jewellers ", "")
+    n = re.sub(r"(\d+) Karat Gold Coin \(([^)]*)\)", r"\1K \2", n)
+    return n.strip()
 
 
 def esc(t):
@@ -412,19 +418,20 @@ def link_line():
     return f'🔗 <a href="{LINK}">Open in Swiggy</a>'
 
 
-def compare_city(old, current):
-    """Update `old` (this city's saved coins). Return alert lines for changed prices and new coins."""
-    had_state = bool(old)  # the first scan of a city only saves a baseline
+def compare_city(old, current, tag=""):
+    """Update `old` (one pincode's saved coins). Return alert lines for changed prices and new coins."""
+    had_state = bool(old)  # the first scan of a pincode only saves a baseline
+    where = f"  · {tag}" if tag else ""
     lines = []
     for name, cur in current.items():
         prev = old.get(name)
         if prev is None:
             if had_state:
-                lines.append(f"🆕 <b>{esc(short(name))}</b>  {inr(cur['price'])}  (new listing)")
+                lines.append(f"🆕 <b>{esc(short(name))}</b>  {inr(cur['price'])}  new listing{where}")
         elif cur["price"] != prev["price"]:
             diff = cur["price"] - prev["price"]
             pct = diff / prev["price"] * 100 if prev["price"] else 0
-            lines.append(f"{'🔺' if diff > 0 else '🔻'} <b>{esc(short(name))}</b>\n"
+            lines.append(f"{'🔺' if diff > 0 else '🔻'} <b>{esc(short(name))}</b>{where}\n"
                          f"      {inr(prev['price'])} → {inr(cur['price'])}   "
                          f"<b>{'+' if diff > 0 else '-'}{inr(abs(diff))}</b> ({pct:+.1f}%)")
         old[name] = cur
@@ -435,26 +442,57 @@ def stamp():
     return datetime.now(IST).strftime("%d %b, %I:%M %p IST")
 
 
-def inventory_report(labels):
-    """First message: stock of every coin in every city."""
+def merged(city):
+    """One city = all its pincodes together. A coin counts as in stock if ANY pincode has it."""
+    out = {}
+    for label, items in STATE.items():
+        if not label.startswith(city + " "):
+            continue
+        pin = label[len(city) + 1:]
+        for name, d in items.items():
+            m = out.setdefault(name, {"price": d["price"], "in_stock": False, "pins": []})
+            if d["in_stock"]:
+                if not m["in_stock"] or d["price"] < m["price"]:
+                    m["price"] = d["price"]
+                m["in_stock"] = True
+                m["pins"].append(pin)
+            elif not m["in_stock"]:
+                m["price"] = min(m["price"], d["price"])
+    return out
+
+
+def city_names(spots):
+    seen = []
+    for sp in spots:
+        if sp.city not in seen:
+            seen.append(sp.city)
+    return seen
+
+
+def inventory_report(spots):
+    """First message: what is in stock in every city, and at which pincodes."""
     blocks = []
-    for label in labels:
-        items, err = STATE.get(label, {}), STATUS[label].get("error")
+    for city in city_names(spots):
+        items = merged(city)
+        mine = [sp for sp in spots if sp.city == city]
         if items:
-            n_in = sum(1 for d in items.values() if d["in_stock"])
-            rows = [f"{'✅' if d['in_stock'] else '⛔'} {esc(short(n))} — {inr(d['price'])}"
-                    for n, d in sorted(items.items(), key=lambda kv: kv[1]["price"])]
-            blocks.append(f"📍 <b>{esc(label)}</b> · {n_in}/{len(items)} in stock\n" + "\n".join(rows) + "\n" + link_line())
-        elif err and not STATUS[label].get("ok"):
-            blocks.append(f"📍 <b>{esc(label)}</b>\n⚠️ could not check yet ({esc(err[:50])})")
+            have = sorted(((n, d) for n, d in items.items() if d["in_stock"]), key=lambda kv: (kv[1]["price"], kv[0]))
+            out = sorted(short(n) for n, d in items.items() if not d["in_stock"])
+            rows = [f"✅ {esc(short(n))} — {inr(d['price'])}  <i>({', '.join(d['pins'][:3])})</i>" for n, d in have]
+            if out:
+                rows.append("⛔ Out: " + esc(", ".join(out)))
+            blocks.append(f"📍 <b>{esc(city)}</b> · {len(have)}/{len(items)} in stock\n" + "\n".join(rows) + "\n" + link_line())
+        elif all(STATUS[sp.label].get("error") and not STATUS[sp.label].get("ok") for sp in mine):
+            blocks.append(f"📍 <b>{esc(city)}</b>\n⚠️ could not check ({esc(STATUS[mine[0].label]['error'][:50])})")
         else:
-            blocks.append(f"📍 <b>{esc(label)}</b>\nNo Kalyan coins listed here")
+            blocks.append(f"📍 <b>{esc(city)}</b>\nNo Kalyan coins listed here")
     return blocks
 
 
 # ---------- /status command ----------
 STATUS = {}  # label -> {"ok": ts, "pod": str, "error": str}
 STATE = {}
+CITIES = []
 
 
 def command_allowed(chat, user):
@@ -472,26 +510,30 @@ def ago(ts):
 
 def status_text(arg=""):
     arg = arg.strip().lower()
-    labels = [l for l in STATUS if not arg or arg in l.lower()]
-    if arg and not labels:
-        return f"No city matches '{arg}'. Cities: " + ", ".join(STATUS)
-    lines = ["📊 Kalyan gold coin tracker" + (f" — {labels[0]}" if arg and len(labels) == 1 else "")]
-    for label in labels:
-        st, items = STATUS[label], STATE.get(label, {})
-        when = f" · {ago(st['ok'])}" if st.get("ok") else " · not checked yet"
-        err = f" · ⚠️ {st['error'][:60]}" if st.get("error") else ""
-        if arg and len(labels) == 1:
-            lines.append(f"📍 {label}{when}{err}")
-            for name, d in sorted(items.items()):
-                lines.append(f"{'✅' if d['in_stock'] else '⛔'} {short(name)} — {inr(d['price'])}")
+    cities = [c for c in CITIES if not arg or arg in c.lower()]
+    if not cities:
+        return f"No city matches '{arg}'. Cities: " + ", ".join(CITIES)
+    one = bool(arg) and len(cities) == 1
+    lines = ["📊 Kalyan gold coin tracker" + (f" — {cities[0]}" if one else "")]
+    for city in cities:
+        items = merged(city)
+        mine = [l for l in STATUS if l.startswith(city + " ")]
+        oks = [STATUS[l]["ok"] for l in mine if STATUS[l].get("ok")]
+        errs = [STATUS[l]["error"] for l in mine if STATUS[l].get("error")]
+        when = f" · {ago(max(oks))}" if oks else " · not checked yet"
+        err = f" · ⚠️ {errs[0][:50]}" if errs and not oks else ""
+        if one:
+            lines.append(f"📍 {city}{when}{err} · pincodes: {', '.join(l[len(city) + 1:] for l in mine)}")
+            for name, d in sorted(items.items(), key=lambda kv: (not kv[1]["in_stock"], kv[1]["price"])):
+                pins = f"  ({', '.join(d['pins'][:3])})" if d["in_stock"] else ""
+                lines.append(f"{'✅' if d['in_stock'] else '⛔'} {short(name)} — {inr(d['price'])}{pins}")
             if not items:
                 lines.append("No Kalyan coins listed here.")
         elif items:
-            prices = [d["price"] for d in items.values()]
-            stock = sum(1 for d in items.values() if d["in_stock"])
-            lines.append(f"📍 {label}: {len(items)} coins, {stock} in stock, from {inr(min(prices))}{when}{err}")
+            n_in = sum(1 for d in items.values() if d["in_stock"])
+            lines.append(f"📍 {city}: {n_in}/{len(items)} in stock{when}{err}")
         else:
-            lines.append(f"📍 {label}: no coins listed{when}{err}")
+            lines.append(f"📍 {city}: no coins listed{when}{err}")
     if not arg:
         lines.append(f"⏱ every {INTERVAL * PACER.scale:.0f}s" + (" (slowed: Instamart rate limit)" if PACER.scale > 1.05 else ""))
         lines.append("Details: /status <city>")
@@ -535,68 +577,77 @@ def command_loop():
 
 
 # ---------- main loop ----------
-def check_city(city, state):
-    """One search for one city. Returns alert lines (possibly empty)."""
+def check_spot(sp, state, pods):
+    """One search for one pincode. Returns alert lines (possibly empty)."""
     for attempt in (1, 2):
         try:
-            doc = city.search()
+            doc = sp.search()
             break
         except Blocked as e:
             if not (e.limited and attempt == 1):
                 raise
-            time.sleep(5 * PACER.scale)  # 429: cool off once, then try the same city again
+            time.sleep(5 * PACER.scale)  # 429: cool off once, then try the same pincode again
     current = parse_items(doc)
-    pod = first_pod(doc)
-    STATUS[city.label] = {"ok": time.time(), "pod": pod, "error": ""}
-    lines = compare_city(state.setdefault(city.label, {}), current)
-    if DRY:
-        coins = ", ".join(f"{short(n)} {inr(d['price'])}{'' if d['in_stock'] else ' (out)'}" for n, d in sorted(current.items()))
-        log(f"{city.label}: store {pod or '?'} · {city.address} · {len(current)} coins" + (f": {coins}" if coins else ""))
-    else:
-        log(f"{city.label}: store {pod or '?'} · {len(current)} coins" + (f" · {len(lines)} change(s)" if lines else ""))
+    sp.pod = first_pod(doc)
+    STATUS[sp.label] = {"ok": time.time(), "pod": sp.pod, "error": ""}
+    # two pincodes of one city served by the same store show the same data: keep only the first
+    if sp.pod and sp.pod in pods.setdefault(sp.city, {}) and pods[sp.city][sp.pod] != sp.label:
+        sp.dup = True
+        state.pop(sp.label, None)
+        STATE.pop(sp.label, None)
+        log(f"{sp.label}: same store {sp.pod} as {pods[sp.city][sp.pod]} -> skipped from now on")
+        return []
+    if sp.pod:
+        pods[sp.city][sp.pod] = sp.label
+    lines = compare_city(state.setdefault(sp.label, {}), current, sp.text)
+    n_in = sum(1 for d in current.values() if d["in_stock"])
+    log(f"{sp.label}: store {sp.pod or '?'} · {n_in}/{len(current)} in stock" + (f" · {len(lines)} change(s)" if lines else "")
+        + (f" · {sp.address}" if DRY else ""))
     return lines
 
 
 def main():
     if "--get-chat-id" in sys.argv:
         return get_chat_id()
-    cities = [City(label, text) for label, text in parse_locations()]
-    labels = [c.label for c in cities]
+    spots = [City(c, t) for c, t in parse_locations()]
+    CITIES[:] = city_names(spots)
     state = {} if DRY else load_state()
     STATE.update(state)
-    for c in cities:
-        STATUS[c.label] = {"ok": None, "pod": "", "error": ""}
-    log(f"{'TEST (nothing sent or saved)' if DRY else 'Tracking'}: '{QUERY}' in {len(cities)} cities. Plain HTTP, no browser. "
-        f"Round every {INTERVAL}s, {BASE_GAP}s between calls (auto-slows on 429). State: {STATE_FILE}")
+    for sp in spots:
+        STATUS[sp.label] = {"ok": None, "pod": "", "error": ""}
+    log(f"{'TEST (nothing sent or saved)' if DRY else 'Tracking'}: '{QUERY}' in {len(CITIES)} cities / {len(spots)} pincodes. "
+        f"Plain HTTP, no browser. Round every {INTERVAL}s (auto-slows on 429). State: {STATE_FILE}")
     if TOKEN and not DRY and os.environ.get("ENABLE_COMMANDS", "1") != "0":
         threading.Thread(target=command_loop, daemon=True).start()
-    first, streak = True, 0
+    send_report = INITIAL_REPORT and not state  # a restart WITH saved state stays quiet
+    pods, streak = {}, 0
     while True:
-        started, blocks = time.time(), []
-        for city in cities:
+        started, blocks = time.time(), {}
+        for sp in [x for x in spots if not x.dup]:
             try:
-                lines = check_city(city, state)
+                lines = check_spot(sp, state, pods)
                 if lines:
-                    blocks.append(f"📍 <b>{esc(city.label)}</b>\n" + "\n".join(lines) + "\n" + link_line())
+                    blocks.setdefault(sp.city, []).extend(lines)
                 streak = 0
             except Exception as e:  # noqa: BLE001
-                city.reset()  # start this city from scratch next round
+                sp.reset()  # start this pincode from scratch next round
                 streak += 1
                 msg = str(e) if isinstance(e, (Blocked, NoPlace)) else f"{type(e).__name__}: {e}"
-                STATUS[city.label]["error"] = msg
-                log(f"{city.label}: failed ({msg})")
+                STATUS[sp.label]["error"] = msg
+                log(f"{sp.label}: failed ({msg})")
                 if streak >= 3 and streak % 6 == 3 and NOTIFY_ERRORS:
                     send(f"⚠️ Tracker: {streak} failed checks in a row. Last: {esc(msg)}")
             STATE.clear()
             STATE.update(state)
         save_state(state)
-        if first and INITIAL_REPORT:
-            send_blocks(f"📦 <b>Kalyan gold coins · stock check</b>\n🕒 {stamp()} · {len(cities)} cities",
-                        inventory_report(labels),
-                        "From now on: quiet checks. You only hear about price changes 🔺🔻 and new listings 🆕.")
+        if send_report:
+            send_blocks(f"📦 <b>Kalyan gold coins · stock check</b>\n🕒 {stamp()} · {len(CITIES)} cities",
+                        inventory_report(spots),
+                        "That was the one-time overview. From now on: quiet checks, a message only for a price change 🔺🔻 or a new listing 🆕.")
+            send_report = False
         elif blocks:
-            send_blocks(f"💰 <b>Kalyan gold coin update</b> · {stamp()}", blocks)
-        first = False
+            send_blocks(f"💰 <b>Kalyan gold coin update</b> · {stamp()}",
+                        [f"📍 <b>{esc(c)}</b>\n" + "\n".join(ls) + "\n" + link_line() for c, ls in blocks.items()])
         if DRY:
             log("Test round finished.")
             return
