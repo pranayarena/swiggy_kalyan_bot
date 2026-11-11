@@ -1,39 +1,45 @@
 #!/usr/bin/env python3
-"""Kalyan gold coin price tracker for Swiggy Instamart, many cities -> Telegram alerts.
+"""Kalyan gold coin tracker for Swiggy Instamart: users pick their own pincode in Telegram.
 
 Pure Python standard library: no Node.js, no browser, no pip packages. Low RAM.
-For every city it picks the delivery spot the way the Instamart website does (place search ->
-coordinates -> select location), then reads that city's store search. Prices and stock differ
-per store, so each city is tracked on its own.
 
-Telegram gets ONLY: price changes (with the amount, up/down) and new coin listings.
-One combined message per round of checks. Send /status to the bot for a health summary.
+How people use the bot (private chat, group, or channel the bot is in):
+  422005            (or /pin 422005)   -> bot looks the pincode up on Instamart, replies with every Kalyan
+                                         gold coin: in stock or out, price, and starts tracking that pincode
+  /list                                -> pincodes this chat tracks
+  /remove 422005                       -> stop tracking a pincode (/remove all)
+  /help
+After the first reply the bot stays quiet and only writes when a tracked pincode has a price change
+(🔺 up / 🔻 down, with the amount) or a new coin listing (🆕).
 
-Test first, nothing is sent:   python swiggy_kalyan_tracker.py --once
-Find your chat id:             python swiggy_kalyan_tracker.py --get-chat-id
+Admin only: /status (health, pincodes watched, request speed).
+
+Test without Telegram, prints what a user would get:   python swiggy_kalyan_tracker.py --pin 422005 411045
+Find a chat id:                                        python swiggy_kalyan_tracker.py --get-chat-id
 
 Env vars (or a .env file next to this script):
   TELEGRAM_BOT_TOKEN   token from @BotFather
-  TELEGRAM_CHAT_ID     chat id, or @channelusername (the bot must be channel admin)
-  TELEGRAM_ADMIN_ID    optional: your numeric Telegram user id(s), comma separated, allowed to use /status
-  LOCATIONS            optional: "Label=search text;Label2=search text2". Search text can be an area,
-                       "pincode city" or an address. Default list: see DEFAULT_LOCATIONS below.
-  CHECK_INTERVAL_SEC   seconds between rounds over all cities, default 120, minimum 30
-  REQUEST_GAP_SEC      pause between single Instamart calls, default 1.5, minimum 1
-  INITIAL_REPORT       default 1 = one stock-check message on a start with no saved state. Set 0 on Voroa after the first deploy (no disk, state resets)
+  TELEGRAM_ADMIN_ID    your numeric Telegram user id(s), comma separated. Admins can use /status and skip the limits
+  TELEGRAM_CHAT_ID     optional: a chat or @channel that is subscribed to DEFAULT_PINCODES at every start
+  DEFAULT_PINCODES     optional: comma list, tracked for TELEGRAM_CHAT_ID (keeps working after a Voroa restart)
+  ALLOWED_CHAT_IDS     optional: comma list of chat ids allowed to use the bot. Empty = everybody
+  MAX_PINS_PER_CHAT    default 5 (admins unlimited)
+  MAX_TOTAL_PINS       default 40: all pincodes together, protects against Instamart rate limits
+  CHECK_INTERVAL_SEC   seconds between rounds over all tracked pincodes, default 120, minimum 30
+  REQUEST_GAP_SEC      pause between single Instamart calls, default 1.5, minimum 1 (auto-slows on 429)
   SEARCH_QUERY         default "kalyan gold coin"
   TRACK_WORDS          comma list, ALL must appear in item name+brand. default "kalyan,gold coin"
-  STATE_FILE           default kalyan_state_pins.json (lost on restart on hosts without a disk)
-  ENABLE_COMMANDS      default 1 = answer /status. Use 0 on a second copy (PC + Voroa) to avoid clashes.
-  NOTIFY_ERRORS        default 0 = Telegram gets ONLY price changes and new SKUs. 1 = also failure warnings.
+  STATE_FILE           default kalyan_tracker_data.json (pincodes + prices. Lost on restart on hosts without a disk)
+  ENABLE_COMMANDS      default 1. Use 0 on a second copy (PC + Voroa) to avoid Telegram 409 clashes.
 """
 import gzip
 import html
 import http.cookiejar
 import json
 import os
-import re
+import queue
 import random
+import re
 import sys
 import threading
 import time
@@ -49,18 +55,6 @@ SEARCH_URL = (BASE + "/api/instamart/search/v2?offset=0&ageConsent=false&voiceSe
 UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) "
       "Chrome/157.0.0.0 Safari/537.36")
 IST = timezone(timedelta(hours=5, minutes=30))
-
-# Tier 1 and tier 2 cities, a few pincodes each. A pincode can map to a store that has nothing in stock while the
-# next one has plenty, so each city gets several. Pincodes that map to the SAME store are detected on the first round
-# and dropped automatically. Instamart does not serve every city; that city just shows "no coins listed".
-# Override with LOCATIONS="City=pin1,pin2;City2=pin"  (a pincode, area or address, anything the site search accepts).
-DEFAULT_LOCATIONS = (
-    "Mumbai=400053,400050,400076,400601;Pune=411045,411001,411014,411057;Nashik=422005,422101,422002,422009;"
-    "Bengaluru=560034,560066,560102,560038;Chennai=600017,600042,600040,600020;"
-    "Hyderabad=500034,500081,500032,500016;Delhi=110017,110001,110075,110092;"
-    "Kolkata=700091,700019,700156;Ahmedabad=380015,380054,380009;Surat=395009,395007;"
-    "Vadodara=390007;Rajkot=360005;Jaipur=302017;Kochi=682024"
-)
 
 
 def load_env_file():
@@ -78,42 +72,38 @@ def load_env_file():
 
 load_env_file()
 
+
+def env_list(name):
+    return [x.strip() for x in os.environ.get(name, "").split(",") if x.strip()]
+
+
+def env_num(name, default, low, cast=int):
+    try:
+        return max(low, cast(os.environ.get(name, str(default))))
+    except ValueError:
+        return default
+
+
 TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "").strip()
 CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "").strip()
-ADMIN_IDS = {x.strip() for x in os.environ.get("TELEGRAM_ADMIN_ID", "").split(",") if x.strip()}
+ADMIN_IDS = set(env_list("TELEGRAM_ADMIN_ID"))
+ALLOWED = set(env_list("ALLOWED_CHAT_IDS"))
+DEFAULT_PINS = [p for p in env_list("DEFAULT_PINCODES") if re.fullmatch(r"\d{6}", p)]
 QUERY = os.environ.get("SEARCH_QUERY", "kalyan gold coin")
 WORDS = [w.strip().lower() for w in os.environ.get("TRACK_WORDS", "kalyan,gold coin").split(",") if w.strip()]
-STATE_FILE = os.environ.get("STATE_FILE", os.path.join(HERE, "kalyan_state_pins.json"))
+STATE_FILE = os.environ.get("STATE_FILE", os.path.join(HERE, "kalyan_tracker_data.json"))
 BUILD = os.environ.get("X_BUILD_VERSION", "2.392.0").strip()
-NOTIFY_ERRORS = os.environ.get("NOTIFY_ERRORS", "0").strip() == "1"
-try:
-    INTERVAL = max(30, int(os.environ.get("CHECK_INTERVAL_SEC", "120")))
-except ValueError:
-    INTERVAL = 120
-try:
-    BASE_GAP = max(1.0, float(os.environ.get("REQUEST_GAP_SEC", "1.5")))
-except ValueError:
-    BASE_GAP = 1.5
+INTERVAL = env_num("CHECK_INTERVAL_SEC", 120, 30)
+BASE_GAP = env_num("REQUEST_GAP_SEC", 1.5, 1.0, float)
+MAX_PER_CHAT = env_num("MAX_PINS_PER_CHAT", 5, 1)
+MAX_TOTAL = env_num("MAX_TOTAL_PINS", 40, 1)
 MAX_SCALE = 16.0  # slowest the tracker will ever go: 16x its normal pace
-INITIAL_REPORT = os.environ.get("INITIAL_REPORT", "1").strip() != "0"
 LINK = BASE + "/search?query=" + urllib.parse.quote(QUERY)  # opens the Swiggy app on a phone
-DRY = "--once" in sys.argv  # dry run: print only, send nothing, save nothing
+DRY = "--pin" in sys.argv  # test mode: print only, send nothing, save nothing
 
 
 def log(msg):
     print(f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] {msg}", flush=True)
-
-
-def parse_locations():
-    """Return [(city, search text)], one entry per pincode."""
-    raw = os.environ.get("LOCATIONS", "").strip() or DEFAULT_LOCATIONS
-    out = []
-    for part in raw.split(";"):
-        city, _, texts = part.strip().partition("=")
-        for t in (texts or city).split(","):
-            if t.strip():
-                out.append((city.strip(), t.strip()))
-    return out
 
 
 # ---------- Telegram ----------
@@ -125,31 +115,39 @@ def tg_api(method, payload=None, timeout=20):
         return json.loads(r.read().decode())
 
 
-def send(text):
-    if DRY or not TOKEN or not CHAT_ID:
-        log("MESSAGE (not sent):\n" + text)
+def send(chat, text):
+    if DRY or not TOKEN:
+        log(f"MESSAGE to {chat} (not sent):\n{text}")
         return
-    log("MESSAGE sent: " + text.split("\n")[0])
     for _ in range(2):
         try:
-            tg_api("sendMessage", {"chat_id": CHAT_ID, "text": text, "parse_mode": "HTML",
+            tg_api("sendMessage", {"chat_id": chat, "text": text, "parse_mode": "HTML",
                                    "disable_web_page_preview": True})
+            log(f"sent to {chat}: " + text.split("\n")[0][:70])
             return
+        except urllib.error.HTTPError as e:
+            body = e.read().decode("utf-8", "replace")[:150]
+            log(f"Telegram send to {chat} failed: HTTP {e.code} {body}")
+            if e.code == 403:  # bot blocked, kicked or chat gone: stop tracking for it
+                drop_chat(str(chat))
+            if e.code in (400, 403):
+                return
+            time.sleep(3)
         except Exception as e:  # noqa: BLE001
-            log(f"Telegram send failed ({e})")
+            log(f"Telegram send to {chat} failed ({e})")
             time.sleep(3)
 
 
-def send_blocks(header, blocks, footer=""):
-    """Send header + city blocks, splitting between blocks so no message passes Telegram's 4096 limit."""
+def send_blocks(chat, header, blocks, footer=""):
+    """Header + blocks, split between blocks so no message passes Telegram's 4096 limit."""
     msg = header
     for blk in blocks + ([footer] if footer else []):
         if len(msg) + len(blk) + 2 > 3800:
-            send(msg)
+            send(chat, msg)
             msg = ""
         msg += ("\n\n" if msg else "") + blk
     if msg:
-        send(msg)
+        send(chat, msg)
 
 
 def get_chat_id():
@@ -161,10 +159,12 @@ def get_chat_id():
         if msg.get("chat"):
             c = msg["chat"]
             seen[c["id"]] = c.get("username") or c.get("title") or c.get("first_name")
+        if msg.get("from"):
+            seen[msg["from"]["id"]] = "user: " + str(msg["from"].get("username") or msg["from"].get("first_name"))
     if not seen:
         sys.exit("No messages found. Open your bot in Telegram, press Start, send 'hi', run again.")
     for cid, name in seen.items():
-        print(f"chat id: {cid}  ({name})")
+        print(f"id: {cid}  ({name})")
 
 
 # ---------- Instamart ----------
@@ -247,9 +247,8 @@ def make_matcher():
 class City:
     """One delivery spot: its own cookies, its own store. Rebuilt from scratch after any failure."""
 
-    def __init__(self, city, text):
-        self.city, self.text, self.label = city, text, f"{city} {text}"
-        self.pod, self.dup = "", False
+    def __init__(self, pin):
+        self.text = self.label = pin
         self.reset()
 
     def reset(self):
@@ -320,7 +319,7 @@ class City:
             addr = hit
             loc = hit["location"]
         else:
-            found = self._call("GET", BASE + "/api/instamart/maps/suggestions?input=" + urllib.parse.quote(f"{self.text} {self.city}" if self.text.isdigit() else self.text))
+            found = self._call("GET", BASE + "/api/instamart/maps/suggestions?input=" + urllib.parse.quote(self.text))
             places = found.get("data") or []
             if not places:
                 raise NoPlace(f"no place found for '{self.text}'")
@@ -406,30 +405,60 @@ def parse_items(doc):
     return found
 
 
-# ---------- state, alerts ----------
-def load_state():
-    try:
-        with open(STATE_FILE, encoding="utf-8") as f:
-            data = json.load(f)
-            return data if isinstance(data, dict) else {}
-    except (OSError, json.JSONDecodeError):
-        return {}
+# ---------- helpers, data ----------
+LOCK = threading.RLock()
+SUBS = {}      # chat id (str) -> [pincode, ...]
+STATE = {}     # pincode -> {coin name: {name, sku, price, mrp, in_stock}}
+META = {}      # pincode -> {"addr": str, "ok": ts, "error": str}
+WAITING = {}   # pincode -> chats waiting for their first full listing
+QUEUE = queue.Queue()
+SESS = {}      # pincode -> City (kept between rounds)
+LAST = {"round": 0.0}
 
 
-def save_state(state):
+def save_data():
     if DRY:
         return
+    with LOCK:
+        blob = {"subs": SUBS, "state": STATE, "addr": {p: m.get("addr", "") for p, m in META.items()}}
     try:
         tmp = STATE_FILE + ".tmp"
         with open(tmp, "w", encoding="utf-8") as f:
-            json.dump(state, f, indent=2)
+            json.dump(blob, f)
         os.replace(tmp, STATE_FILE)
     except OSError as e:
-        log(f"Could not save state ({e}). Alerts still work until restart.")
+        log(f"Could not save data ({e}). Tracking still works until restart.")
+
+
+def load_data():
+    try:
+        with open(STATE_FILE, encoding="utf-8") as f:
+            blob = json.load(f)
+    except (OSError, json.JSONDecodeError):
+        return
+    SUBS.update(blob.get("subs", {}))
+    STATE.update(blob.get("state", {}))
+    for p, a in blob.get("addr", {}).items():
+        META[p] = {"addr": a, "ok": None, "error": ""}
+
+
+def watched():
+    with LOCK:
+        return sorted({p for pins in SUBS.values() for p in pins})
+
+
+def drop_chat(chat):
+    with LOCK:
+        SUBS.pop(chat, None)
+    save_data()
 
 
 def inr(n):
     return f"₹{n:,}"
+
+
+def esc(t):
+    return html.escape(str(t), quote=False)
 
 
 def short(name):
@@ -439,97 +468,53 @@ def short(name):
     return n.strip()
 
 
-def esc(t):
-    return html.escape(str(t), quote=False)
-
-
 def link_line():
     return f'🔗 <a href="{LINK}">Open in Swiggy</a>'
 
 
-def compare_city(old, current, tag=""):
+def place_name(addr):
+    """'Nashik, Maharashtra 422005, India' -> 'Nashik, Maharashtra'"""
+    return re.sub(r"\s*\b\d{6}\b", "", addr or "").replace(", India", "").strip(" ,")
+
+
+def compare(old, current, had_state):
     """Update `old` (one pincode's saved coins). Return alert lines for changed prices and new coins."""
-    had_state = bool(old)  # the first scan of a pincode only saves a baseline
-    where = f"  · {tag}" if tag else ""
     lines = []
     for name, cur in current.items():
         prev = old.get(name)
         if prev is None:
             if had_state:
-                lines.append(f"🆕 <b>{esc(short(name))}</b>  {inr(cur['price'])}  new listing{where}")
+                lines.append(f"🆕 <b>{esc(short(name))}</b>  {inr(cur['price'])}  new listing")
         elif cur["price"] != prev["price"]:
             diff = cur["price"] - prev["price"]
             pct = diff / prev["price"] * 100 if prev["price"] else 0
-            lines.append(f"{'🔺' if diff > 0 else '🔻'} <b>{esc(short(name))}</b>{where}\n"
+            lines.append(f"{'🔺' if diff > 0 else '🔻'} <b>{esc(short(name))}</b>\n"
                          f"      {inr(prev['price'])} → {inr(cur['price'])}   "
                          f"<b>{'+' if diff > 0 else '-'}{inr(abs(diff))}</b> ({pct:+.1f}%)")
         old[name] = cur
     return lines
 
 
+def pin_title(pin):
+    place = place_name(META.get(pin, {}).get("addr", ""))
+    return f"📍 <b>{pin}</b>" + (f" · {esc(place)}" if place else "")
+
+
+def pin_report(pin):
+    """Every Kalyan coin at this pincode: in stock first, cheapest first, out of stock on one line."""
+    items = STATE.get(pin, {})
+    if not items:
+        return pin_title(pin) + "\nNo Kalyan coins listed here (area may not be served)."
+    have = sorted(((n, d) for n, d in items.items() if d["in_stock"]), key=lambda kv: (kv[1]["price"], kv[0]))
+    out = sorted(short(n) for n, d in items.items() if not d["in_stock"])
+    rows = [f"✅ {esc(short(n))} — {inr(d['price'])}" for n, d in have]
+    if out:
+        rows.append("⛔ Out: " + esc(", ".join(out)))
+    return pin_title(pin) + f" · {len(have)}/{len(items)} in stock\n" + "\n".join(rows) + "\n" + link_line()
+
+
 def stamp():
     return datetime.now(IST).strftime("%d %b, %I:%M %p IST")
-
-
-def merged(city):
-    """One city = all its pincodes together. A coin counts as in stock if ANY pincode has it."""
-    out = {}
-    for label, items in STATE.items():
-        if not label.startswith(city + " "):
-            continue
-        pin = label[len(city) + 1:]
-        for name, d in items.items():
-            m = out.setdefault(name, {"price": d["price"], "in_stock": False, "pins": []})
-            if d["in_stock"]:
-                if not m["in_stock"] or d["price"] < m["price"]:
-                    m["price"] = d["price"]
-                m["in_stock"] = True
-                m["pins"].append(pin)
-            elif not m["in_stock"]:
-                m["price"] = min(m["price"], d["price"])
-    return out
-
-
-def city_names(spots):
-    seen = []
-    for sp in spots:
-        if sp.city not in seen:
-            seen.append(sp.city)
-    return seen
-
-
-def inventory_report(spots):
-    """First message: what is in stock in every city, and at which pincodes."""
-    blocks = []
-    for city in city_names(spots):
-        items = merged(city)
-        mine = [sp for sp in spots if sp.city == city]
-        if items:
-            have = sorted(((n, d) for n, d in items.items() if d["in_stock"]), key=lambda kv: (kv[1]["price"], kv[0]))
-            out = sorted(short(n) for n, d in items.items() if not d["in_stock"])
-            rows = [f"✅ {esc(short(n))} — {inr(d['price'])}  <i>({', '.join(d['pins'][:3])})</i>" for n, d in have]
-            if out:
-                rows.append("⛔ Out: " + esc(", ".join(out)))
-            blocks.append(f"📍 <b>{esc(city)}</b> · {len(have)}/{len(items)} in stock\n" + "\n".join(rows) + "\n" + link_line())
-        elif all(STATUS[sp.label].get("error") and not STATUS[sp.label].get("ok") for sp in mine):
-            blocks.append(f"📍 <b>{esc(city)}</b>\n⚠️ could not check ({esc(STATUS[mine[0].label]['error'][:50])})")
-        else:
-            blocks.append(f"📍 <b>{esc(city)}</b>\nNo Kalyan coins listed here")
-    return blocks
-
-
-# ---------- /status command ----------
-STATUS = {}  # label -> {"ok": ts, "pod": str, "error": str}
-STATE = {}
-CITIES = []
-
-
-def command_allowed(chat, user):
-    ids = {str(chat.get("id")), str((user or {}).get("id", ""))}
-    if ids & ADMIN_IDS:
-        return True
-    want = CHAT_ID.lstrip("@").lower()
-    return bool(want) and want in (str(chat.get("id")), (chat.get("username") or "").lower())
 
 
 def ago(ts):
@@ -537,36 +522,185 @@ def ago(ts):
     return f"{s}s ago" if s < 120 else (f"{s // 60}m ago" if s < 7200 else f"{s // 3600}h ago")
 
 
-def status_text(arg=""):
-    arg = arg.strip().lower()
-    cities = [c for c in CITIES if not arg or arg in c.lower()]
-    if not cities:
-        return f"No city matches '{arg}'. Cities: " + ", ".join(CITIES)
-    one = bool(arg) and len(cities) == 1
-    lines = ["📊 Kalyan gold coin tracker" + (f" — {cities[0]}" if one else "")]
-    for city in cities:
-        items = merged(city)
-        mine = [l for l in STATUS if l.startswith(city + " ")]
-        oks = [STATUS[l]["ok"] for l in mine if STATUS[l].get("ok")]
-        errs = [STATUS[l]["error"] for l in mine if STATUS[l].get("error")]
-        when = f" · {ago(max(oks))}" if oks else " · not checked yet"
-        err = f" · ⚠️ {errs[0][:50]}" if errs and not oks else ""
-        if one:
-            lines.append(f"📍 {city}{when}{err} · pincodes: {', '.join(l[len(city) + 1:] for l in mine)}")
-            for name, d in sorted(items.items(), key=lambda kv: (not kv[1]["in_stock"], kv[1]["price"])):
-                pins = f"  ({', '.join(d['pins'][:3])})" if d["in_stock"] else ""
-                lines.append(f"{'✅' if d['in_stock'] else '⛔'} {short(name)} — {inr(d['price'])}{pins}")
-            if not items:
-                lines.append("No Kalyan coins listed here.")
-        elif items:
-            n_in = sum(1 for d in items.values() if d["in_stock"])
-            lines.append(f"📍 {city}: {n_in}/{len(items)} in stock{when}{err}")
+# ---------- tracker (one thread: all Instamart calls) ----------
+def process_pin(pin):
+    """Check one pincode. First time: save baseline and send the full listing. After: return alert lines."""
+    sess = SESS.get(pin) or SESS.setdefault(pin, City(pin))
+    try:
+        for attempt in (1, 2):
+            try:
+                doc = sess.search()
+                break
+            except Blocked as e:
+                if not (e.limited and attempt == 1):
+                    raise
+                time.sleep(5 * PACER.scale)  # 429: cool off once, then try the same pincode again
+    except NoPlace:
+        with LOCK:
+            chats = [c for c, pins in SUBS.items() if pin in pins and pin not in STATE]
+            for c in chats:
+                SUBS[c].remove(pin)
+            WAITING.pop(pin, None)
+        for c in chats:
+            send(c, f"❌ Instamart does not know pincode <b>{pin}</b>. Check it and send again.")
+        save_data()
+        return []
+    except Exception as e:  # noqa: BLE001
+        sess.reset()  # start this pincode from scratch next time
+        msg = str(e) if isinstance(e, Blocked) else f"{type(e).__name__}: {e}"
+        META.setdefault(pin, {})["error"] = msg
+        log(f"{pin}: failed ({msg})")
+        return []
+    current = parse_items(doc)
+    n_in = sum(1 for d in current.values() if d["in_stock"])
+    with LOCK:
+        META[pin] = {"addr": sess.address, "ok": time.time(), "error": ""}
+        first = pin not in STATE
+        lines = compare(STATE.setdefault(pin, {}), current, had_state=not first)
+        waiting = WAITING.pop(pin, set())
+    log(f"{pin}: {place_name(sess.address)} · {n_in}/{len(current)} in stock · store {first_pod(doc) or '?'}"
+        + (f" · {len(lines)} change(s)" if lines else ""))
+    if waiting or DRY:
+        for c in (waiting or {"test"}):
+            send(c, pin_report(pin) + f"\n\n✅ Tracking <b>{pin}</b>. I will only message you on a price change "
+                 "🔺🔻 or a new listing 🆕.\n/list · /remove " + pin)
+    save_data()
+    return [] if first else lines
+
+
+def run_round():
+    alerts = {}
+    for pin in watched():
+        while not QUEUE.empty():  # new pincodes asked for by users go first
+            lookup_now(QUEUE.get())
+        lines = process_pin(pin)
+        if lines:
+            alerts[pin] = lines
+    with LOCK:
+        live = set(watched())
+        for pin in list(STATE):  # pincodes nobody tracks any more
+            if pin not in live:
+                STATE.pop(pin, None)
+                META.pop(pin, None)
+                SESS.pop(pin, None)
+        subs = {c: list(pins) for c, pins in SUBS.items()}
+    for chat, pins in subs.items():
+        blocks = [pin_title(p) + "\n" + "\n".join(alerts[p]) + "\n" + link_line() for p in pins if p in alerts]
+        if blocks:
+            send_blocks(chat, f"💰 <b>Kalyan gold coin update</b> · {stamp()}", blocks)
+    LAST["round"] = time.time()
+
+
+def lookup_now(pin):
+    if pin in watched() and pin not in STATE:
+        process_pin(pin)
+
+
+def tracker_loop():
+    next_round = 0.0
+    while True:
+        try:
+            try:
+                lookup_now(QUEUE.get(timeout=2))
+                continue
+            except queue.Empty:
+                pass
+            if time.time() >= next_round:
+                run_round()
+                next_round = time.time() + INTERVAL * PACER.scale * random.uniform(0.95, 1.05)
+        except Exception as e:  # noqa: BLE001
+            log(f"Tracker loop error ({type(e).__name__}: {e}). Continuing.")
+            time.sleep(10)
+
+
+# ---------- Telegram commands ----------
+HELP = ("🪙 <b>Kalyan gold coin tracker</b> (Swiggy Instamart)\n\n"
+        "Send a 6-digit <b>pincode</b>, for example <code>422005</code>.\n"
+        "I show every Kalyan gold coin there, in stock or out, with prices. Then I track it and message you "
+        "only when a price goes 🔺 up or 🔻 down, or a new coin appears 🆕.\n\n"
+        "/list · your pincodes\n/remove 422005 · stop tracking one\n/remove all · stop everything")
+
+
+def allowed(chat, user):
+    ids = {str(chat.get("id")), str((user or {}).get("id", ""))}
+    return not ALLOWED or bool(ids & (ALLOWED | ADMIN_IDS))
+
+
+def is_admin(chat, user):
+    return bool({str(chat.get("id")), str((user or {}).get("id", ""))} & ADMIN_IDS)
+
+
+def add_pins(chat_id, pins, admin):
+    for pin in pins:
+        with LOCK:
+            mine = SUBS.setdefault(chat_id, [])
+            if pin in mine:
+                note = pin_report(pin) if pin in STATE else f"⏳ Still fetching <b>{pin}</b>. Hold on."
+                msg = note + ("\n\n(You already track this pincode.)" if pin in STATE else "")
+            elif len(mine) >= MAX_PER_CHAT and not admin:
+                msg = f"⚠️ You can track {MAX_PER_CHAT} pincodes. /remove one first. /list shows them."
+            elif pin not in watched() and len(watched()) >= MAX_TOTAL and not admin:
+                msg = "⚠️ The bot is full right now. Try again later."
+            else:
+                mine.append(pin)
+                if pin in STATE:
+                    msg = pin_report(pin) + f"\n\n✅ Tracking <b>{pin}</b>. Quiet from now on: only price changes 🔺🔻 and new coins 🆕."
+                else:
+                    WAITING.setdefault(pin, set()).add(chat_id)
+                    QUEUE.put(pin)
+                    msg = f"🔎 Checking <b>{pin}</b> on Instamart. Takes up to a minute."
+        send(chat_id, msg)
+    save_data()
+
+
+def handle(msg):
+    chat, user = msg.get("chat") or {}, msg.get("from")
+    text = (msg.get("text") or "").strip()
+    if not text or not allowed(chat, user):
+        return
+    cid, admin = str(chat["id"]), is_admin(chat, user)
+    words = text.split()
+    cmd = words[0].split("@")[0].lower() if words[0].startswith("/") else ""
+    args = " ".join(words[1:]) if cmd else text
+    pins = list(dict.fromkeys(re.findall(r"\b\d{6}\b", args)))
+    if cmd in ("/start", "/help"):
+        send(cid, HELP)
+    elif cmd in ("/pin", "/add", "/track", "/check") or (not cmd and re.fullmatch(r"[\d\s,]+", text) and pins):
+        if pins:
+            add_pins(cid, pins[:5], admin)
         else:
-            lines.append(f"📍 {city}: no coins listed{when}{err}")
-    if not arg:
-        lines.append(f"⏱ every {INTERVAL * PACER.scale:.0f}s" + (" (slowed: Instamart rate limit)" if PACER.scale > 1.05 else ""))
-        lines.append("Details: /status <city>")
-    return "\n".join(lines)
+            send(cid, "Send a 6-digit pincode, for example <code>422005</code>.")
+    elif cmd == "/list":
+        mine = SUBS.get(cid, [])
+        if not mine:
+            send(cid, "You track nothing yet. Send a 6-digit pincode.")
+        else:
+            rows = []
+            for p in mine:
+                items = STATE.get(p)
+                stock = f" · {sum(1 for d in items.values() if d['in_stock'])}/{len(items)} in stock" if items else " · fetching"
+                rows.append(pin_title(p) + stock)
+            send(cid, "📋 <b>Your pincodes</b>\n" + "\n".join(rows) + "\n\n/remove 422005 to stop one")
+    elif cmd in ("/remove", "/stop", "/untrack"):
+        with LOCK:
+            mine = SUBS.get(cid, [])
+            gone = list(mine) if args.strip().lower() == "all" else [p for p in pins if p in mine]
+            for p in gone:
+                mine.remove(p)
+            if not mine:
+                SUBS.pop(cid, None)
+        save_data()
+        send(cid, ("🗑 Stopped tracking: " + ", ".join(gone)) if gone else "Nothing removed. /list shows your pincodes.")
+    elif cmd == "/status" and admin:
+        pins_all = watched()
+        errs = [f"{p}: {m['error'][:40]}" for p, m in META.items() if m.get("error")]
+        send(cid, "📊 <b>Status</b>\n"
+             f"Chats: {len(SUBS)} · pincodes watched: {len(pins_all)}/{MAX_TOTAL}\n"
+             f"Last round: {ago(LAST['round']) if LAST['round'] else 'not yet'}\n"
+             f"Speed: a round every {INTERVAL * PACER.scale:.0f}s" + (" (slowed by Instamart rate limit)" if PACER.scale > 1.05 else "")
+             + ("\n⚠️ " + esc("; ".join(errs[:5])) if errs else ""))
+    elif cmd:
+        send(cid, HELP)
 
 
 def command_loop():
@@ -574,113 +708,54 @@ def command_loop():
     while True:
         try:
             payload = {"timeout": 25, "allowed_updates": ["message", "channel_post"]}
-            if offset is None:
-                payload.update(offset=-1, timeout=0)  # first call: skip old messages
-            else:
+            if offset is not None:
                 payload["offset"] = offset
-            updates = tg_api("getUpdates", payload, timeout=40).get("result", [])
-            warned = False
-            if offset is None:
-                offset = (updates[-1]["update_id"] + 1) if updates else 0
-                continue
-            for u in updates:
+            for u in tg_api("getUpdates", payload, timeout=40).get("result", []):
                 offset = u["update_id"] + 1
-                msg = u.get("message") or u.get("channel_post") or {}
-                words = (msg.get("text") or "").split()
-                cmd = words[0].split("@")[0].lower() if words else ""
-                chat = msg.get("chat") or {}
-                if cmd in ("/status", "/prices", "/start", "/help") and command_allowed(chat, msg.get("from")):
-                    text = status_text(" ".join(words[1:])) if cmd in ("/status", "/prices") \
-                        else "Commands: /status (all cities) or /status <city>"
-                    tg_api("sendMessage", {"chat_id": chat["id"], "text": text})
+                try:
+                    handle(u.get("message") or u.get("channel_post") or {})
+                except Exception as e:  # noqa: BLE001
+                    log(f"Command error ({type(e).__name__}: {e})")
+            warned = False
         except urllib.error.HTTPError as e:
             if e.code == 409 and not warned:
-                log("Commands: another copy of this bot is polling Telegram (PC and Voroa both running?). Retrying.")
+                log("Another copy of this bot is polling Telegram (PC and Voroa both running?). Retrying.")
                 warned = True
             time.sleep(30)
         except Exception as e:  # noqa: BLE001
             if not warned:
-                log(f"Commands: Telegram polling problem ({e}). Retrying.")
+                log(f"Telegram polling problem ({e}). Retrying.")
                 warned = True
             time.sleep(15)
 
 
-# ---------- main loop ----------
-def check_spot(sp, state, pods):
-    """One search for one pincode. Returns alert lines (possibly empty)."""
-    for attempt in (1, 2):
-        try:
-            doc = sp.search()
-            break
-        except Blocked as e:
-            if not (e.limited and attempt == 1):
-                raise
-            time.sleep(5 * PACER.scale)  # 429: cool off once, then try the same pincode again
-    current = parse_items(doc)
-    sp.pod = first_pod(doc)
-    STATUS[sp.label] = {"ok": time.time(), "pod": sp.pod, "error": ""}
-    # two pincodes of one city served by the same store show the same data: keep only the first
-    if sp.pod and sp.pod in pods.setdefault(sp.city, {}) and pods[sp.city][sp.pod] != sp.label:
-        sp.dup = True
-        state.pop(sp.label, None)
-        STATE.pop(sp.label, None)
-        log(f"{sp.label}: same store {sp.pod} as {pods[sp.city][sp.pod]} -> skipped from now on")
-        return []
-    if sp.pod:
-        pods[sp.city][sp.pod] = sp.label
-    lines = compare_city(state.setdefault(sp.label, {}), current, sp.text)
-    n_in = sum(1 for d in current.values() if d["in_stock"])
-    log(f"{sp.label}: store {sp.pod or '?'} · {n_in}/{len(current)} in stock" + (f" · {len(lines)} change(s)" if lines else "")
-        + (f" · {sp.address}" if DRY else ""))
-    return lines
-
-
+# ---------- main ----------
 def main():
     if "--get-chat-id" in sys.argv:
         return get_chat_id()
-    spots = [City(c, t) for c, t in parse_locations()]
-    CITIES[:] = city_names(spots)
-    state = {} if DRY else load_state()
-    STATE.update(state)
-    for sp in spots:
-        STATUS[sp.label] = {"ok": None, "pod": "", "error": ""}
-    log(f"{'TEST (nothing sent or saved)' if DRY else 'Tracking'}: '{QUERY}' in {len(CITIES)} cities / {len(spots)} pincodes. "
-        f"Plain HTTP, no browser. Round every {INTERVAL}s (auto-slows on 429). State: {STATE_FILE}")
-    if TOKEN and not DRY and os.environ.get("ENABLE_COMMANDS", "1") != "0":
-        threading.Thread(target=command_loop, daemon=True).start()
-    send_report = INITIAL_REPORT and not state  # a restart WITH saved state stays quiet
-    pods, streak = {}, 0
-    while True:
-        started, blocks = time.time(), {}
-        for sp in [x for x in spots if not x.dup]:
-            try:
-                lines = check_spot(sp, state, pods)
-                if lines:
-                    blocks.setdefault(sp.city, []).extend(lines)
-                streak = 0
-            except Exception as e:  # noqa: BLE001
-                sp.reset()  # start this pincode from scratch next round
-                streak += 1
-                msg = str(e) if isinstance(e, (Blocked, NoPlace)) else f"{type(e).__name__}: {e}"
-                STATUS[sp.label]["error"] = msg
-                log(f"{sp.label}: failed ({msg})")
-                if streak >= 3 and streak % 6 == 3 and NOTIFY_ERRORS:
-                    send(f"⚠️ Tracker: {streak} failed checks in a row. Last: {esc(msg)}")
-            STATE.clear()
-            STATE.update(state)
-        save_state(state)
-        if send_report:
-            send_blocks(f"📦 <b>Kalyan gold coins · stock check</b>\n🕒 {stamp()} · {len(CITIES)} cities",
-                        inventory_report(spots),
-                        "That was the one-time overview. From now on: quiet checks, a message only for a price change 🔺🔻 or a new listing 🆕.")
-            send_report = False
-        elif blocks:
-            send_blocks(f"💰 <b>Kalyan gold coin update</b> · {stamp()}",
-                        [f"📍 <b>{esc(c)}</b>\n" + "\n".join(ls) + "\n" + link_line() for c, ls in blocks.items()])
-        if DRY:
-            log("Test round finished.")
-            return
-        time.sleep(max(5.0, INTERVAL * PACER.scale - (time.time() - started)) * random.uniform(0.95, 1.05))
+    if DRY:  # --pin 422005 411045: print what a user would see
+        pins = re.findall(r"\b\d{6}\b", " ".join(sys.argv[1:]))
+        if not pins:
+            sys.exit("Usage: python swiggy_kalyan_tracker.py --pin 422005 411045")
+        SUBS["test"] = pins
+        for pin in pins:
+            process_pin(pin)
+        return
+    if not TOKEN:
+        sys.exit("Set TELEGRAM_BOT_TOKEN first (in .env next to this script).")
+    load_data()
+    if CHAT_ID and DEFAULT_PINS:
+        with LOCK:
+            mine = SUBS.setdefault(CHAT_ID, [])
+            mine.extend(p for p in DEFAULT_PINS if p not in mine)
+    log(f"Tracking '{QUERY}'. {len(watched())} pincode(s) from {len(SUBS)} chat(s). Round every {INTERVAL}s, "
+        f"{BASE_GAP}s between calls (auto-slows on 429). Plain HTTP, no browser. Data: {STATE_FILE}")
+    threading.Thread(target=tracker_loop, daemon=True).start()
+    if os.environ.get("ENABLE_COMMANDS", "1") != "0":
+        command_loop()
+    else:
+        while True:
+            time.sleep(3600)
 
 
 if __name__ == "__main__":
