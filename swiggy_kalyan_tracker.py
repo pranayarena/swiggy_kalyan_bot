@@ -5,12 +5,12 @@ Pure Python standard library: no Node.js, no browser, no pip packages. Low RAM.
 
 How people use the bot (private chat, group, or channel the bot is in):
   422005            (or /pin 422005)   -> bot looks the pincode up on Instamart, replies with every Kalyan
-                                         gold coin: in stock or out, price, and starts tracking that pincode
+                                         gold coin SKU and price, then tracks prices for those same SKUs
   /list                                -> pincodes this chat tracks
   /remove 422005                       -> stop tracking a pincode (/remove all)
   /help
-After the first reply the bot stays quiet and only writes when a tracked pincode has a price change
-(🔺 up / 🔻 down, with the amount) or a new coin listing (🆕).
+After the first reply, the bot only sends alerts when the price of the same SKU changes
+(🔺 up / 🔻 down, with the amount). It does not report stock or new listings.
 
 Admin only: /status (health, pincodes watched, request speed).
 
@@ -20,8 +20,6 @@ Find a chat id:                                        python swiggy_kalyan_trac
 Env vars (or a .env file next to this script):
   TELEGRAM_BOT_TOKEN   token from @BotFather
   TELEGRAM_ADMIN_ID    your numeric Telegram user id(s), comma separated. Admins can use /status and skip the limits
-  TELEGRAM_CHAT_ID     optional: a chat or @channel that is subscribed to DEFAULT_PINCODES at every start
-  DEFAULT_PINCODES     optional: comma list, tracked for TELEGRAM_CHAT_ID (keeps working after a Voroa restart)
   ALLOWED_CHAT_IDS     optional: comma list of chat ids allowed to use the bot. Empty = everybody
   MAX_PINS_PER_CHAT    default 5 (admins unlimited)
   MAX_TOTAL_PINS       default 40: all pincodes together, protects against Instamart rate limits
@@ -85,10 +83,8 @@ def env_num(name, default, low, cast=int):
 
 
 TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "").strip()
-CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "").strip()
 ADMIN_IDS = set(env_list("TELEGRAM_ADMIN_ID"))
 ALLOWED = set(env_list("ALLOWED_CHAT_IDS"))
-DEFAULT_PINS = [p for p in env_list("DEFAULT_PINCODES") if re.fullmatch(r"\d{6}", p)]
 QUERY = os.environ.get("SEARCH_QUERY", "kalyan gold coin")
 WORDS = [w.strip().lower() for w in os.environ.get("TRACK_WORDS", "kalyan,gold coin").split(",") if w.strip()]
 STATE_FILE = os.environ.get("STATE_FILE", os.path.join(HERE, "kalyan_tracker_data.json"))
@@ -384,31 +380,27 @@ def first_pod(doc):
 
 
 def parse_items(doc):
-    """Return {coin name: {...}} for items whose name+brand contain every TRACK_WORDS entry.
-
-    The key is the coin NAME, not the SKU id: each store has its own SKU ids for the same coin."""
+    """Return matching products keyed by SKU ID. Stock and inventory are ignored."""
     found = {}
     for it in walk(doc):
         name, brand = it.get("displayName", ""), it.get("brand", "")
         for var in it["variations"]:
             price = var.get("price") or {}
             offer = to_int((price.get("offerPrice") or {}).get("units"))
-            mrp = to_int((price.get("mrp") or {}).get("units"))
-            sku = var.get("skuId")
+            sku = str(var.get("skuId") or "").strip()
             if not sku or offer is None:
                 continue
             full = var.get("displayName") or name
             if not all(w in (full + " " + (brand or var.get("brandName", ""))).lower() for w in WORDS):
                 continue
-            stock = bool(it.get("inStock")) and bool((var.get("inventory") or {}).get("inStock", True))
-            found.setdefault(full, {"name": full, "sku": sku, "price": offer, "mrp": mrp, "in_stock": stock})
+            found[sku] = {"name": full, "sku": sku, "price": offer}
     return found
 
 
 # ---------- helpers, data ----------
 LOCK = threading.RLock()
 SUBS = {}      # chat id (str) -> [pincode, ...]
-STATE = {}     # pincode -> {coin name: {name, sku, price, mrp, in_stock}}
+STATE = {}     # pincode -> {SKU ID: {name, sku, price}}
 META = {}      # pincode -> {"addr": str, "ok": ts, "error": str}
 WAITING = {}   # pincode -> chats waiting for their first full listing
 QUEUE = queue.Queue()
@@ -436,8 +428,24 @@ def load_data():
             blob = json.load(f)
     except (OSError, json.JSONDecodeError):
         return
-    SUBS.update(blob.get("subs", {}))
-    STATE.update(blob.get("state", {}))
+    SUBS.update({str(chat): [str(pin) for pin in pins if re.fullmatch(r"\d{6}", str(pin))]
+                 for chat, pins in blob.get("subs", {}).items() if isinstance(pins, list)})
+    # Migrate the older name-keyed state so the first deployment still compares the same SKU.
+    for pin, items in blob.get("state", {}).items():
+        if not isinstance(items, dict):
+            continue
+        normalized = {}
+        for old_key, item in items.items():
+            if not isinstance(item, dict) or not isinstance(item.get("price"), int):
+                continue
+            sku = str(item.get("sku") or old_key).strip()
+            if sku:
+                normalized[sku] = {
+                    "name": str(item.get("name") or old_key),
+                    "sku": sku,
+                    "price": item["price"],
+                }
+        STATE[str(pin)] = normalized
     for p, a in blob.get("addr", {}).items():
         META[p] = {"addr": a, "ok": None, "error": ""}
 
@@ -477,21 +485,24 @@ def place_name(addr):
     return re.sub(r"\s*\b\d{6}\b", "", addr or "").replace(", India", "").strip(" ,")
 
 
-def compare(old, current, had_state):
-    """Update `old` (one pincode's saved coins). Return alert lines for changed prices and new coins."""
+def compare(old, current):
+    """Compare by SKU ID, then replace the baseline. Only same-SKU price moves alert."""
     lines = []
-    for name, cur in current.items():
-        prev = old.get(name)
-        if prev is None:
-            if had_state:
-                lines.append(f"🆕 <b>{esc(short(name))}</b>  {inr(cur['price'])}  new listing")
-        elif cur["price"] != prev["price"]:
-            diff = cur["price"] - prev["price"]
-            pct = diff / prev["price"] * 100 if prev["price"] else 0
-            lines.append(f"{'🔺' if diff > 0 else '🔻'} <b>{esc(short(name))}</b>\n"
-                         f"      {inr(prev['price'])} → {inr(cur['price'])}   "
-                         f"<b>{'+' if diff > 0 else '-'}{inr(abs(diff))}</b> ({pct:+.1f}%)")
-        old[name] = cur
+    latest = {}
+    for sku, cur in current.items():
+        prev = old.get(sku)
+        if prev is not None and cur["price"] != prev.get("price"):
+            name = cur["name"]
+            before = prev.get("price")
+            if isinstance(before, int):
+                diff = cur["price"] - before
+                pct = diff / before * 100 if before else 0
+                lines.append(f"{'🔺' if diff > 0 else '🔻'} <b>{esc(short(name))}</b> · SKU <code>{esc(sku)}</code>\n"
+                             f"      {inr(before)} → {inr(cur['price'])}   "
+                             f"<b>{'+' if diff > 0 else '-'}{inr(abs(diff))}</b> ({pct:+.1f}%)")
+        latest[sku] = {"name": cur["name"], "sku": sku, "price": cur["price"]}
+    old.clear()
+    old.update(latest)
     return lines
 
 
@@ -501,16 +512,16 @@ def pin_title(pin):
 
 
 def pin_report(pin):
-    """Every Kalyan coin at this pincode: in stock first, cheapest first, out of stock on one line."""
+    """Matching SKU names and current prices for one pincode."""
     items = STATE.get(pin, {})
     if not items:
-        return pin_title(pin) + "\nNo Kalyan coins listed here (area may not be served)."
-    have = sorted(((n, d) for n, d in items.items() if d["in_stock"]), key=lambda kv: (kv[1]["price"], kv[0]))
-    out = sorted(short(n) for n, d in items.items() if not d["in_stock"])
-    rows = [f"✅ {esc(short(n))} — {inr(d['price'])}" for n, d in have]
-    if out:
-        rows.append("⛔ Out: " + esc(", ".join(out)))
-    return pin_title(pin) + f" · {len(have)}/{len(items)} in stock\n" + "\n".join(rows) + "\n" + link_line()
+        return pin_title(pin) + "\nNo matching Kalyan gold coin SKUs were found here."
+    rows = sorted(items.items(), key=lambda pair: (pair[1]["price"], pair[1]["name"]))
+    lines = [
+        f"• <b>{esc(short(item['name']))}</b> — {inr(item['price'])} · SKU <code>{esc(sku)}</code>"
+        for sku, item in rows
+    ]
+    return pin_title(pin) + f" · {len(items)} matching SKU(s)\n" + "\n".join(lines) + "\n" + link_line()
 
 
 def stamp():
@@ -524,7 +535,7 @@ def ago(ts):
 
 # ---------- tracker (one thread: all Instamart calls) ----------
 def process_pin(pin):
-    """Check one pincode. First time: save baseline and send the full listing. After: return alert lines."""
+    """Check one pincode. First time: send SKU prices. Later: return same-SKU price changes."""
     sess = SESS.get(pin) or SESS.setdefault(pin, City(pin))
     try:
         for attempt in (1, 2):
@@ -552,18 +563,17 @@ def process_pin(pin):
         log(f"{pin}: failed ({msg})")
         return []
     current = parse_items(doc)
-    n_in = sum(1 for d in current.values() if d["in_stock"])
     with LOCK:
         META[pin] = {"addr": sess.address, "ok": time.time(), "error": ""}
         first = pin not in STATE
-        lines = compare(STATE.setdefault(pin, {}), current, had_state=not first)
+        lines = compare(STATE.setdefault(pin, {}), current)
         waiting = WAITING.pop(pin, set())
-    log(f"{pin}: {place_name(sess.address)} · {n_in}/{len(current)} in stock · store {first_pod(doc) or '?'}"
+    log(f"{pin}: {place_name(sess.address)} · {len(current)} matching SKU(s) · store {first_pod(doc) or '?'}"
         + (f" · {len(lines)} change(s)" if lines else ""))
     if waiting or DRY:
         for c in (waiting or {"test"}):
-            send(c, pin_report(pin) + f"\n\n✅ Tracking <b>{pin}</b>. I will only message you on a price change "
-                 "🔺🔻 or a new listing 🆕.\n/list · /remove " + pin)
+            send(c, pin_report(pin) + f"\n\n✅ Tracking price changes for the same SKU IDs at <b>{pin}</b>. "
+                 "Use /list or /remove " + pin)
     save_data()
     return [] if first else lines
 
@@ -616,8 +626,8 @@ def tracker_loop():
 # ---------- Telegram commands ----------
 HELP = ("🪙 <b>Kalyan gold coin tracker</b> (Swiggy Instamart)\n\n"
         "Send a 6-digit <b>pincode</b>, for example <code>422005</code>.\n"
-        "I show every Kalyan gold coin there, in stock or out, with prices. Then I track it and message you "
-        "only when a price goes 🔺 up or 🔻 down, or a new coin appears 🆕.\n\n"
+        "I show matching Kalyan gold coin SKUs and prices. Then I track those same SKU IDs and message you "
+        "only when their prices go 🔺 up or 🔻 down. Stock is not checked.\n\n"
         "/list · your pincodes\n/remove 422005 · stop tracking one\n/remove all · stop everything")
 
 
@@ -644,7 +654,7 @@ def add_pins(chat_id, pins, admin):
             else:
                 mine.append(pin)
                 if pin in STATE:
-                    msg = pin_report(pin) + f"\n\n✅ Tracking <b>{pin}</b>. Quiet from now on: only price changes 🔺🔻 and new coins 🆕."
+                    msg = pin_report(pin) + f"\n\n✅ Tracking same-SKU price changes at <b>{pin}</b>."
                 else:
                     WAITING.setdefault(pin, set()).add(chat_id)
                     QUEUE.put(pin)
@@ -678,8 +688,8 @@ def handle(msg):
             rows = []
             for p in mine:
                 items = STATE.get(p)
-                stock = f" · {sum(1 for d in items.values() if d['in_stock'])}/{len(items)} in stock" if items else " · fetching"
-                rows.append(pin_title(p) + stock)
+                count = f" · {len(items)} matching SKU(s)" if items is not None else " · fetching"
+                rows.append(pin_title(p) + count)
             send(cid, "📋 <b>Your pincodes</b>\n" + "\n".join(rows) + "\n\n/remove 422005 to stop one")
     elif cmd in ("/remove", "/stop", "/untrack"):
         with LOCK:
@@ -744,10 +754,6 @@ def main():
     if not TOKEN:
         sys.exit("Set TELEGRAM_BOT_TOKEN first (in .env next to this script).")
     load_data()
-    if CHAT_ID and DEFAULT_PINS:
-        with LOCK:
-            mine = SUBS.setdefault(CHAT_ID, [])
-            mine.extend(p for p in DEFAULT_PINS if p not in mine)
     log(f"Tracking '{QUERY}'. {len(watched())} pincode(s) from {len(SUBS)} chat(s). Round every {INTERVAL}s, "
         f"{BASE_GAP}s between calls (auto-slows on 429). Plain HTTP, no browser. Data: {STATE_FILE}")
     threading.Thread(target=tracker_loop, daemon=True).start()
