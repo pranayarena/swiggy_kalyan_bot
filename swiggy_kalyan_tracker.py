@@ -554,10 +554,10 @@ def pin_report(pin):
 
 
 def pin_result_keyboard(pin):
-    return {"inline_keyboard": [[{
-        "text": "🗑 Remove this PIN",
-        "callback_data": "remove_pin:" + pin,
-    }]]}
+    return {"inline_keyboard": [
+        [{"text": "🗑 Remove this PIN", "callback_data": "remove_pin:" + pin}],
+        [{"text": "🛑 Remove all PINs", "callback_data": "remove_all_pins"}],
+    ]}
 
 
 def send_pin_report(chat_id, pin, footer=""):
@@ -778,11 +778,14 @@ def handle_callback(query):
     except Exception as error:  # noqa: BLE001
         log(f"Could not acknowledge Telegram button ({type(error).__name__})")
 
-    match = re.fullmatch(r"remove_pin:(\d{6})", data)
-    if not match or not chat_id or not allowed(chat, user):
+    if not chat_id or not allowed(chat, user):
         return
-    pin = match.group(1)
-    removed = unsubscribe_pins(chat_id, [pin])
+    remove_all = data == "remove_all_pins"
+    match = re.fullmatch(r"remove_pin:(\d{6})", data)
+    if not remove_all and not match:
+        return
+    pin = match.group(1) if match else None
+    removed = unsubscribe_pins(chat_id) if remove_all else unsubscribe_pins(chat_id, [pin])
     if removed:
         message_id = message.get("message_id")
         if message_id is not None:
@@ -793,10 +796,19 @@ def handle_callback(query):
                 })
             except Exception as error:  # noqa: BLE001
                 log(f"Could not clear removed-PIN button ({type(error).__name__})")
-        send(chat_id, f"🗑 Stopped tracking PIN <b>{pin}</b>. Send another PIN or a city name whenever you’re ready.")
-        log(f"Chat unsubscribed from PIN {pin} using the result button")
+        if remove_all:
+            details = ", ".join(removed)
+            send(chat_id, f"🗑 Stopped tracking all PINs (<code>{esc(details)}</code>). "
+                 "Send another PIN or a city name whenever you’re ready.")
+            log(f"Chat unsubscribed from all PINs using a result button ({len(removed)} removed)")
+        else:
+            send(chat_id, f"🗑 Stopped tracking PIN <b>{pin}</b>. Send another PIN or a city name whenever you’re ready.")
+            log(f"Chat unsubscribed from PIN {pin} using the result button")
     else:
-        send(chat_id, f"PIN <b>{pin}</b> is no longer tracked by this chat. Send another PIN or a city name.")
+        if remove_all:
+            send(chat_id, "No PINs are currently being tracked. Send another PIN or a city name whenever you’re ready.")
+        else:
+            send(chat_id, f"PIN <b>{pin}</b> is no longer tracked by this chat. Send another PIN or a city name.")
 
 
 def handle(msg):
