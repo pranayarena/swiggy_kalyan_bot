@@ -1,27 +1,26 @@
 #!/usr/bin/env python3
-"""Kalyan gold coin tracker for Swiggy Instamart: users pick their own pincode in Telegram.
+"""Kalyan gold coin tracker for Swiggy Instamart: users choose PINs or a city in Telegram.
 
 Pure Python standard library: no Node.js, no browser, no pip packages. Low RAM.
 
-How people use the bot (private chat, group, or channel the bot is in):
-  422005            (or /pin 422005)   -> bot looks the pincode up on Instamart, replies with every Kalyan
-                                         gold coin SKU and price, then tracks prices for those same SKUs
-  /list                                -> pincodes this chat tracks
-  /remove 422005                       -> stop tracking a pincode (/remove all)
-  /help
-After the first reply, the bot only sends alerts when the price of the same SKU changes
-(🔺 up / 🔻 down, with the amount). It does not report stock or new listings.
+How people use the bot:
+  /start      -> short intro and prompt for PINs or a city
+  PIN(s)      -> current Kalyan SKU prices and stock, then same-SKU price alerts
+  City name   -> resolve at least 10 local PINs, show the PINs, and track them
+  /list       -> PINs this chat tracks
+  /remove PIN or /remove all
+It checks only PINs the user submits or PINs resolved from a city they request.
 
 Admin only: /status (health, pincodes watched, request speed).
 
-Test without Telegram, prints what a user would get:   python swiggy_kalyan_tracker.py --pin 422005 411045
+Test without Telegram, prints what a user would get:   python swiggy_kalyan_tracker.py --pin PIN [PIN ...]
 Find a chat id:                                        python swiggy_kalyan_tracker.py --get-chat-id
 
 Env vars (or a .env file next to this script):
   TELEGRAM_BOT_TOKEN   token from @BotFather
   TELEGRAM_ADMIN_ID    your numeric Telegram user id(s), comma separated. Admins can use /status and skip the limits
   ALLOWED_CHAT_IDS     optional: comma list of chat ids allowed to use the bot. Empty = everybody
-  MAX_PINS_PER_CHAT    default 5 (admins unlimited)
+  MAX_PINS_PER_CHAT    default 20 (admins unlimited; supports two city selections)
   MAX_TOTAL_PINS       default 40: all pincodes together, protects against Instamart rate limits
   CHECK_INTERVAL_SEC   seconds between rounds over all tracked pincodes, default 120, minimum 30
   REQUEST_GAP_SEC      pause between single Instamart calls, default 1.5, minimum 1 (auto-slows on 429)
@@ -91,7 +90,7 @@ STATE_FILE = os.environ.get("STATE_FILE", os.path.join(HERE, "kalyan_tracker_dat
 BUILD = os.environ.get("X_BUILD_VERSION", "2.392.0").strip()
 INTERVAL = env_num("CHECK_INTERVAL_SEC", 120, 30)
 BASE_GAP = env_num("REQUEST_GAP_SEC", 1.5, 1.0, float)
-MAX_PER_CHAT = env_num("MAX_PINS_PER_CHAT", 5, 1)
+MAX_PER_CHAT = env_num("MAX_PINS_PER_CHAT", 20, 1)
 MAX_TOTAL = env_num("MAX_TOTAL_PINS", 40, 1)
 MAX_SCALE = 16.0  # slowest the tracker will ever go: 16x its normal pace
 LINK = BASE + "/search?query=" + urllib.parse.quote(QUERY)  # opens the Swiggy app on a phone
@@ -111,14 +110,17 @@ def tg_api(method, payload=None, timeout=20):
         return json.loads(r.read().decode())
 
 
-def send(chat, text):
+def send(chat, text, reply_markup=None):
     if DRY or not TOKEN:
         log(f"MESSAGE to {chat} (not sent):\n{text}")
         return
+    payload = {"chat_id": chat, "text": text, "parse_mode": "HTML",
+               "disable_web_page_preview": True}
+    if reply_markup:
+        payload["reply_markup"] = reply_markup
     for _ in range(2):
         try:
-            tg_api("sendMessage", {"chat_id": chat, "text": text, "parse_mode": "HTML",
-                                   "disable_web_page_preview": True})
+            tg_api("sendMessage", payload)
             log(f"sent to {chat}: " + text.split("\n")[0][:70])
             return
         except urllib.error.HTTPError as e:
@@ -380,7 +382,7 @@ def first_pod(doc):
 
 
 def parse_items(doc):
-    """Return matching products keyed by SKU ID. Stock and inventory are ignored."""
+    """Return matching products keyed by SKU ID, including stock and product-link data."""
     found = {}
     for it in walk(doc):
         name, brand = it.get("displayName", ""), it.get("brand", "")
@@ -393,7 +395,12 @@ def parse_items(doc):
             full = var.get("displayName") or name
             if not all(w in (full + " " + (brand or var.get("brandName", ""))).lower() for w in WORDS):
                 continue
-            found[sku] = {"name": full, "sku": sku, "price": offer}
+            product_id = it.get("productId") or it.get("product_id") or it.get("id") or sku
+            stock = bool(it.get("inStock")) and bool((var.get("inventory") or {}).get("inStock", True))
+            found[sku] = {
+                "name": full, "sku": sku, "product_id": str(product_id),
+                "price": offer, "in_stock": stock,
+            }
     return found
 
 
@@ -443,7 +450,9 @@ def load_data():
                 normalized[sku] = {
                     "name": str(item.get("name") or old_key),
                     "sku": sku,
+                    "product_id": str(item.get("product_id") or sku),
                     "price": item["price"],
+                    "in_stock": bool(item.get("in_stock", True)),
                 }
         STATE[str(pin)] = normalized
     for p, a in blob.get("addr", {}).items():
@@ -480,8 +489,19 @@ def link_line():
     return f'🔗 <a href="{LINK}">Open in Swiggy</a>'
 
 
+def item_link(item):
+    product_id = str(item.get("product_id") or item.get("sku") or "").strip()
+    if not product_id:
+        return LINK
+    return "https://www.swiggy.com/instamart/item/" + urllib.parse.quote(product_id, safe="")
+
+
+def item_link_line(item):
+    return f'<a href="{html.escape(item_link(item), quote=True)}">Open item</a>'
+
+
 def place_name(addr):
-    """'Nashik, Maharashtra 422005, India' -> 'Nashik, Maharashtra'"""
+    """Remove the postal code from a provider-formatted place label."""
     return re.sub(r"\s*\b\d{6}\b", "", addr or "").replace(", India", "").strip(" ,")
 
 
@@ -499,8 +519,13 @@ def compare(old, current):
                 pct = diff / before * 100 if before else 0
                 lines.append(f"{'🔺' if diff > 0 else '🔻'} <b>{esc(short(name))}</b> · SKU <code>{esc(sku)}</code>\n"
                              f"      {inr(before)} → {inr(cur['price'])}   "
-                             f"<b>{'+' if diff > 0 else '-'}{inr(abs(diff))}</b> ({pct:+.1f}%)")
-        latest[sku] = {"name": cur["name"], "sku": sku, "price": cur["price"]}
+                             f"<b>{'+' if diff > 0 else '-'}{inr(abs(diff))}</b> ({pct:+.1f}%) · "
+                             f"{item_link_line(cur)}")
+        latest[sku] = {
+            "name": cur["name"], "sku": sku,
+            "product_id": cur.get("product_id") or sku,
+            "price": cur["price"], "in_stock": bool(cur.get("in_stock")),
+        }
     old.clear()
     old.update(latest)
     return lines
@@ -512,16 +537,31 @@ def pin_title(pin):
 
 
 def pin_report(pin):
-    """Matching SKU names and current prices for one pincode."""
+    """Matching SKU names, prices, stock status, and direct links for one pincode."""
     items = STATE.get(pin, {})
     if not items:
         return pin_title(pin) + "\nNo matching Kalyan gold coin SKUs were found here."
-    rows = sorted(items.items(), key=lambda pair: (pair[1]["price"], pair[1]["name"]))
+    rows = sorted(items.items(), key=lambda pair: (not pair[1].get("in_stock", False), pair[1]["price"], pair[1]["name"]))
     lines = [
-        f"• <b>{esc(short(item['name']))}</b> — {inr(item['price'])} · SKU <code>{esc(sku)}</code>"
+        f"{'✅' if item.get('in_stock') else '❌'} <b>{esc(short(item['name']))}</b> — {inr(item['price'])} · "
+        f"SKU <code>{esc(sku)}</code> · {item_link_line(item)}"
         for sku, item in rows
     ]
     return pin_title(pin) + f" · {len(items)} matching SKU(s)\n" + "\n".join(lines) + "\n" + link_line()
+
+
+def pin_result_keyboard(pin):
+    return {"inline_keyboard": [[{
+        "text": "🗑 Remove this PIN",
+        "callback_data": "remove_pin:" + pin,
+    }]]}
+
+
+def send_pin_report(chat_id, pin, footer=""):
+    message = pin_report(pin)
+    if footer:
+        message += "\n\n" + footer
+    send(chat_id, message, reply_markup=pin_result_keyboard(pin))
 
 
 def stamp():
@@ -531,6 +571,22 @@ def stamp():
 def ago(ts):
     s = int(time.time() - ts)
     return f"{s}s ago" if s < 120 else (f"{s // 60}m ago" if s < 7200 else f"{s // 3600}h ago")
+
+
+def resolve_city_pins(city):
+    """Look up delivery post-office PINs only when a user explicitly submits a city."""
+    url = "https://api.postalpincode.in/postoffice/" + urllib.parse.quote(city, safe="")
+    req = urllib.request.Request(url, headers={"User-Agent": UA, "Accept": "application/json"})
+    with urllib.request.urlopen(req, timeout=12) as response:
+        result = json.loads(response.read().decode())
+    offices = result[0].get("PostOffice") or [] if result else []
+    found, seen = [], set()
+    for office in offices:
+        pin = str(office.get("Pincode") or "").strip()
+        if re.fullmatch(r"\d{6}", pin) and pin not in seen:
+            seen.add(pin)
+            found.append(pin)
+    return found[:10], len(found)
 
 
 # ---------- tracker (one thread: all Instamart calls) ----------
@@ -572,8 +628,8 @@ def process_pin(pin):
         + (f" · {len(lines)} change(s)" if lines else ""))
     if waiting or DRY:
         for c in (waiting or {"test"}):
-            send(c, pin_report(pin) + f"\n\n✅ Tracking price changes for the same SKU IDs at <b>{pin}</b>. "
-                 "Use /list or /remove " + pin)
+            send_pin_report(c, pin, "✅ Tracking price changes for these same SKU IDs. "
+                            "Use the button below to remove this PIN.")
     save_data()
     return [] if first else lines
 
@@ -625,10 +681,12 @@ def tracker_loop():
 
 # ---------- Telegram commands ----------
 HELP = ("🪙 <b>Kalyan gold coin tracker</b> (Swiggy Instamart)\n\n"
-        "Send a 6-digit <b>pincode</b>, for example <code>422005</code>.\n"
-        "I show matching Kalyan gold coin SKUs and prices. Then I track those same SKU IDs and message you "
-        "only when their prices go 🔺 up or 🔻 down. Stock is not checked.\n\n"
-        "/list · your pincodes\n/remove 422005 · stop tracking one\n/remove all · stop everything")
+        "Send one or more 6-digit <b>PIN codes</b>, or send a <b>city name</b>.\n"
+        "For a city, I find 10 postal PINs and track only those requested areas.\n"
+        "I return matching Kalyan coin SKUs, prices, stock marks, and item links. After that, I alert only when "
+        "the price of the same SKU goes 🔺 up or 🔻 down.\n\n"
+        "Use the <b>Remove this PIN</b> button below a result to stop it.\n"
+        "/list · your PINs\n/remove <PIN> · stop tracking one\n/remove all · stop everything")
 
 
 def allowed(chat, user):
@@ -640,27 +698,106 @@ def is_admin(chat, user):
     return bool({str(chat.get("id")), str((user or {}).get("id", ""))} & ADMIN_IDS)
 
 
+def unsubscribe_pins(chat_id, pins=None):
+    chat_id = str(chat_id)
+    with LOCK:
+        mine = SUBS.get(chat_id, [])
+        gone = list(mine) if pins is None else [pin for pin in pins if pin in mine]
+        for pin in gone:
+            mine.remove(pin)
+            pending = WAITING.get(pin)
+            if pending:
+                pending.discard(chat_id)
+                if not pending:
+                    WAITING.pop(pin, None)
+        if not mine:
+            SUBS.pop(chat_id, None)
+    save_data()
+    return gone
+
+
 def add_pins(chat_id, pins, admin):
+    added, ready, waiting, rejected = [], [], [], []
     for pin in pins:
         with LOCK:
             mine = SUBS.setdefault(chat_id, [])
             if pin in mine:
-                note = pin_report(pin) if pin in STATE else f"⏳ Still fetching <b>{pin}</b>. Hold on."
-                msg = note + ("\n\n(You already track this pincode.)" if pin in STATE else "")
-            elif len(mine) >= MAX_PER_CHAT and not admin:
-                msg = f"⚠️ You can track {MAX_PER_CHAT} pincodes. /remove one first. /list shows them."
-            elif pin not in watched() and len(watched()) >= MAX_TOTAL and not admin:
-                msg = "⚠️ The bot is full right now. Try again later."
-            else:
-                mine.append(pin)
                 if pin in STATE:
-                    msg = pin_report(pin) + f"\n\n✅ Tracking same-SKU price changes at <b>{pin}</b>."
+                    ready.append(pin)
                 else:
                     WAITING.setdefault(pin, set()).add(chat_id)
                     QUEUE.put(pin)
-                    msg = f"🔎 Checking <b>{pin}</b> on Instamart. Takes up to a minute."
-        send(chat_id, msg)
+                    waiting.append(pin)
+            elif len(mine) >= MAX_PER_CHAT and not admin:
+                rejected.append(pin)
+            elif pin not in watched() and len(watched()) >= MAX_TOTAL and not admin:
+                rejected.append(pin)
+            else:
+                mine.append(pin)
+                if pin in STATE:
+                    ready.append(pin)
+                else:
+                    WAITING.setdefault(pin, set()).add(chat_id)
+                    QUEUE.put(pin)
+                    added.append(pin)
+    if added or waiting:
+        pending = list(dict.fromkeys(added + waiting))
+        send(chat_id, "🔎 Checking your requested PINs: <code>" + ", ".join(pending) +
+             "</code>. I’ll send each result as it finishes.")
+    if ready:
+        for pin in dict.fromkeys(ready):
+            send_pin_report(chat_id, pin, "Tracking same-SKU price changes. Use the button below to remove this PIN.")
+    if rejected:
+        send(chat_id, f"⚠️ Could not add <code>{esc(', '.join(dict.fromkeys(rejected)))}</code>. "
+             f"This bot allows up to {MAX_PER_CHAT} PINs per chat and {MAX_TOTAL} total active PINs.")
     save_data()
+
+
+def add_city(chat_id, city, admin):
+    try:
+        pins, total = resolve_city_pins(city)
+    except Exception as error:  # noqa: BLE001
+        log(f"Postal lookup for city '{city}' failed ({type(error).__name__})")
+        send(chat_id, "I couldn’t look up that city right now. Try again, or send PIN codes directly.")
+        return
+    if total < 10:
+        send(chat_id, f"I found only {total} postal PIN(s) for <b>{esc(city)}</b>. "
+             "Please add PIN codes directly or include a clearer city name.")
+        return
+    send(chat_id, f"📍 Found 10 PINs for <b>{esc(city)}</b>: <code>{', '.join(pins)}</code>")
+    add_pins(chat_id, pins, admin)
+
+
+def handle_callback(query):
+    message = query.get("message") or {}
+    chat = message.get("chat") or {}
+    user = query.get("from") or {}
+    chat_id = str(chat.get("id", ""))
+    data = str(query.get("data") or "")
+    try:
+        tg_api("answerCallbackQuery", {"callback_query_id": query.get("id", "")})
+    except Exception as error:  # noqa: BLE001
+        log(f"Could not acknowledge Telegram button ({type(error).__name__})")
+
+    match = re.fullmatch(r"remove_pin:(\d{6})", data)
+    if not match or not chat_id or not allowed(chat, user):
+        return
+    pin = match.group(1)
+    removed = unsubscribe_pins(chat_id, [pin])
+    if removed:
+        message_id = message.get("message_id")
+        if message_id is not None:
+            try:
+                tg_api("editMessageReplyMarkup", {
+                    "chat_id": chat_id, "message_id": message_id,
+                    "reply_markup": {"inline_keyboard": []},
+                })
+            except Exception as error:  # noqa: BLE001
+                log(f"Could not clear removed-PIN button ({type(error).__name__})")
+        send(chat_id, f"🗑 Stopped tracking PIN <b>{pin}</b>. Send another PIN or a city name whenever you’re ready.")
+        log(f"Chat unsubscribed from PIN {pin} using the result button")
+    else:
+        send(chat_id, f"PIN <b>{pin}</b> is no longer tracked by this chat. Send another PIN or a city name.")
 
 
 def handle(msg):
@@ -673,33 +810,47 @@ def handle(msg):
     cmd = words[0].split("@")[0].lower() if words[0].startswith("/") else ""
     args = " ".join(words[1:]) if cmd else text
     pins = list(dict.fromkeys(re.findall(r"\b\d{6}\b", args)))
+    city_text = re.sub(r"\b\d{6}\b", "", args)
+    city_text = re.sub(r"\b(?:and|or)\b", "", city_text, flags=re.IGNORECASE).strip(" ,;\t\n")
     if cmd in ("/start", "/help"):
         send(cid, HELP)
-    elif cmd in ("/pin", "/add", "/track", "/check") or (not cmd and re.fullmatch(r"[\d\s,]+", text) and pins):
+    elif cmd in ("/pin", "/add", "/track", "/check") or (not cmd and pins):
         if pins:
-            add_pins(cid, pins[:5], admin)
+            add_pins(cid, pins, admin)
+            if city_text:
+                for city in [part.strip() for part in city_text.split(",") if part.strip()]:
+                    add_city(cid, city, admin)
+        elif city_text:
+            for city in [part.strip() for part in city_text.split(",") if part.strip()]:
+                add_city(cid, city, admin)
         else:
-            send(cid, "Send a 6-digit pincode, for example <code>422005</code>.")
+            send(cid, "Send one or more six-digit PINs, or a city name.")
+    elif cmd == "/city":
+        if city_text:
+            for city in [part.strip() for part in city_text.split(",") if part.strip()]:
+                add_city(cid, city, admin)
+        else:
+            send(cid, "Send a city name after /city, or send PIN codes directly.")
+    elif not cmd and city_text:
+        for city in [part.strip() for part in city_text.split(",") if part.strip()]:
+            add_city(cid, city, admin)
     elif cmd == "/list":
         mine = SUBS.get(cid, [])
         if not mine:
-            send(cid, "You track nothing yet. Send a 6-digit pincode.")
+            send(cid, "You are not tracking any PINs yet. Send PIN codes or a city name.")
         else:
             rows = []
             for p in mine:
                 items = STATE.get(p)
-                count = f" · {len(items)} matching SKU(s)" if items is not None else " · fetching"
+                if items is None:
+                    count = " · fetching"
+                else:
+                    available = sum(1 for item in items.values() if item.get("in_stock"))
+                    count = f" · {available}/{len(items)} in stock"
                 rows.append(pin_title(p) + count)
-            send(cid, "📋 <b>Your pincodes</b>\n" + "\n".join(rows) + "\n\n/remove 422005 to stop one")
+            send(cid, "📋 <b>Your PINs</b>\n" + "\n".join(rows) + "\n\nUse /remove &lt;PIN&gt; to stop one")
     elif cmd in ("/remove", "/stop", "/untrack"):
-        with LOCK:
-            mine = SUBS.get(cid, [])
-            gone = list(mine) if args.strip().lower() == "all" else [p for p in pins if p in mine]
-            for p in gone:
-                mine.remove(p)
-            if not mine:
-                SUBS.pop(cid, None)
-        save_data()
+        gone = unsubscribe_pins(cid) if args.strip().lower() == "all" else unsubscribe_pins(cid, pins)
         send(cid, ("🗑 Stopped tracking: " + ", ".join(gone)) if gone else "Nothing removed. /list shows your pincodes.")
     elif cmd == "/status" and admin:
         pins_all = watched()
@@ -717,13 +868,16 @@ def command_loop():
     offset, warned = None, False
     while True:
         try:
-            payload = {"timeout": 25, "allowed_updates": ["message", "channel_post"]}
+            payload = {"timeout": 25, "allowed_updates": ["message", "channel_post", "callback_query"]}
             if offset is not None:
                 payload["offset"] = offset
             for u in tg_api("getUpdates", payload, timeout=40).get("result", []):
                 offset = u["update_id"] + 1
                 try:
-                    handle(u.get("message") or u.get("channel_post") or {})
+                    if u.get("callback_query"):
+                        handle_callback(u["callback_query"])
+                    else:
+                        handle(u.get("message") or u.get("channel_post") or {})
                 except Exception as e:  # noqa: BLE001
                     log(f"Command error ({type(e).__name__}: {e})")
             warned = False
@@ -743,10 +897,10 @@ def command_loop():
 def main():
     if "--get-chat-id" in sys.argv:
         return get_chat_id()
-    if DRY:  # --pin 422005 411045: print what a user would see
+    if DRY:  # --pin PIN [PIN ...]: print what a user would see
         pins = re.findall(r"\b\d{6}\b", " ".join(sys.argv[1:]))
         if not pins:
-            sys.exit("Usage: python swiggy_kalyan_tracker.py --pin 422005 411045")
+            sys.exit("Usage: python swiggy_kalyan_tracker.py --pin PIN [PIN ...]")
         SUBS["test"] = pins
         for pin in pins:
             process_pin(pin)
