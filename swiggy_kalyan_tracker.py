@@ -10,6 +10,7 @@ How people use the bot:
   /list       -> PINs this chat tracks
   /remove PIN or /remove all
 It checks only PINs the user submits or PINs resolved from a city they request.
+Tracking subscriptions are cleared on restart; users submit their PINs or city again.
 
 Admin only: /status (health, pincodes watched, request speed).
 
@@ -419,7 +420,9 @@ def save_data():
     if DRY:
         return
     with LOCK:
-        blob = {"subs": SUBS, "state": STATE, "addr": {p: m.get("addr", "") for p, m in META.items()}}
+        # Subscriptions are deliberately session-only: restarting the service must
+        # never resume polling locations selected in an earlier run.
+        blob = {"state": STATE, "addr": {p: m.get("addr", "") for p, m in META.items()}}
     try:
         tmp = STATE_FILE + ".tmp"
         with open(tmp, "w", encoding="utf-8") as f:
@@ -435,8 +438,6 @@ def load_data():
             blob = json.load(f)
     except (OSError, json.JSONDecodeError):
         return
-    SUBS.update({str(chat): [str(pin) for pin in pins if re.fullmatch(r"\d{6}", str(pin))]
-                 for chat, pins in blob.get("subs", {}).items() if isinstance(pins, list)})
     # Migrate the older name-keyed state so the first deployment still compares the same SKU.
     for pin, items in blob.get("state", {}).items():
         if not isinstance(items, dict):
@@ -457,6 +458,8 @@ def load_data():
         STATE[str(pin)] = normalized
     for p, a in blob.get("addr", {}).items():
         META[p] = {"addr": a, "ok": None, "error": ""}
+    # Rewrite legacy state without saved subscriptions so they cannot resume later.
+    save_data()
 
 
 def watched():
@@ -682,7 +685,8 @@ def tracker_loop():
 # ---------- Telegram commands ----------
 HELP = ("🥇 <b>Kalyan gold coin tracker</b> · Swiggy Instamart\n"
         "I can show matching SKUs, prices, stock, and direct item links from Swiggy Instamart.\n\n"
-        "Which PIN code(s) or city should I check?")
+        "Which PIN code(s) or city should I check?\n"
+        "Tracking stops when the service restarts; send your locations again afterward.")
 
 
 def allowed(chat, user):
@@ -904,7 +908,7 @@ def main():
     if not TOKEN:
         sys.exit("Set TELEGRAM_BOT_TOKEN first (in .env next to this script).")
     load_data()
-    log(f"Tracking '{QUERY}'. {len(watched())} pincode(s) from {len(SUBS)} chat(s). Round every {INTERVAL}s, "
+    log(f"Started Swiggy tracker. No PINs are active until a user requests them. Round every {INTERVAL}s, "
         f"{BASE_GAP}s between calls (auto-slows on 429). Plain HTTP, no browser. Data: {STATE_FILE}")
     threading.Thread(target=tracker_loop, daemon=True).start()
     if os.environ.get("ENABLE_COMMANDS", "1") != "0":
