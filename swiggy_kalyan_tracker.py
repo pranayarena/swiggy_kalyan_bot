@@ -680,13 +680,9 @@ def tracker_loop():
 
 
 # ---------- Telegram commands ----------
-HELP = ("🪙 <b>Kalyan gold coin tracker</b> (Swiggy Instamart)\n\n"
-        "Send one or more 6-digit <b>PIN codes</b>, or send a <b>city name</b>.\n"
-        "For a city, I find 10 postal PINs and track only those requested areas.\n"
-        "I return matching Kalyan coin SKUs, prices, stock marks, and item links. After that, I alert only when "
-        "the price of the same SKU goes 🔺 up or 🔻 down.\n\n"
-        "Use the <b>Remove this PIN</b> button below a result to stop it.\n"
-        "/list · your PINs\n/remove <PIN> · stop tracking one\n/remove all · stop everything")
+HELP = ("🥇 <b>Kalyan gold coin tracker</b> · Swiggy Instamart\n"
+        "I can show matching SKUs, prices, stock, and direct item links from Swiggy Instamart.\n\n"
+        "Which PIN code(s) or city should I check?")
 
 
 def allowed(chat, user):
