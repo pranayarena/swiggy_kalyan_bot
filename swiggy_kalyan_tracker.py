@@ -685,8 +685,7 @@ def tracker_loop():
 # ---------- Telegram commands ----------
 HELP = ("🥇 <b>Kalyan gold coin tracker</b> · Swiggy Instamart\n"
         "I can show matching SKUs, prices, stock, and direct item links from Swiggy Instamart.\n\n"
-        "Which PIN code(s) or city should I check?\n"
-        "Tracking stops when the service restarts; send your locations again afterward.")
+        "Which PIN code(s) or city should I check?")
 
 
 def allowed(chat, user):
