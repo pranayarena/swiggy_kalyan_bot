@@ -5,7 +5,7 @@ Pure Python standard library: no Node.js, no browser, no pip packages. Low RAM.
 
 How people use the bot:
   /start      -> short intro and prompt for PINs or a city
-  PIN(s)      -> current Kalyan SKU prices and stock, then same-SKU price alerts
+  PIN(s)      -> current Kalyan SKU prices and stock; alerts for price changes, new in-stock SKUs, and restocks
   City name   -> resolve at least 10 local PINs, show the PINs, and track them
   /list       -> PINs this chat tracks
   /remove PIN or /remove all
@@ -509,21 +509,32 @@ def place_name(addr):
 
 
 def compare(old, current):
-    """Compare by SKU ID, then replace the baseline. Only same-SKU price moves alert."""
+    """Alert only for same-SKU price moves, newly listed in-stock SKUs, and restocks."""
     lines = []
     latest = {}
     for sku, cur in current.items():
         prev = old.get(sku)
-        if prev is not None and cur["price"] != prev.get("price"):
-            name = cur["name"]
+        name = esc(short(cur["name"]))
+        sku_text = f"SKU <code>{esc(sku)}</code>"
+        price_text = inr(cur["price"])
+        stock_text = "✅ In stock" if cur.get("in_stock") else "❌ Out of stock"
+        item_link = item_link_line(cur)
+
+        if prev is None:
+            if cur.get("in_stock"):
+                lines.append(f"🆕 <b>New SKU in stock:</b> {name} — {price_text} · {sku_text} · "
+                             f"{stock_text} · {item_link}")
+        else:
             before = prev.get("price")
-            if isinstance(before, int):
+            if isinstance(before, int) and cur["price"] != before:
                 diff = cur["price"] - before
                 pct = diff / before * 100 if before else 0
-                lines.append(f"{'🔺' if diff > 0 else '🔻'} <b>{esc(short(name))}</b> · SKU <code>{esc(sku)}</code>\n"
+                lines.append(f"{'🔺' if diff > 0 else '🔻'} <b>Price change:</b> {name} · {sku_text}\n"
                              f"      {inr(before)} → {inr(cur['price'])}   "
                              f"<b>{'+' if diff > 0 else '-'}{inr(abs(diff))}</b> ({pct:+.1f}%) · "
-                             f"{item_link_line(cur)}")
+                             f"{stock_text} · {item_link}")
+            if not prev.get("in_stock", False) and cur.get("in_stock"):
+                lines.append(f"✅ <b>Back in stock:</b> {name} — {price_text} · {sku_text} · {item_link}")
         latest[sku] = {
             "name": cur["name"], "sku": sku,
             "product_id": cur.get("product_id") or sku,
@@ -594,7 +605,7 @@ def resolve_city_pins(city):
 
 # ---------- tracker (one thread: all Instamart calls) ----------
 def process_pin(pin):
-    """Check one pincode. First time: send SKU prices. Later: return same-SKU price changes."""
+    """Check one PIN; send a full first result, then only price, new-stock, or restock changes."""
     sess = SESS.get(pin) or SESS.setdefault(pin, City(pin))
     try:
         for attempt in (1, 2):
@@ -631,7 +642,7 @@ def process_pin(pin):
         + (f" · {len(lines)} change(s)" if lines else ""))
     if waiting or DRY:
         for c in (waiting or {"test"}):
-            send_pin_report(c, pin, "✅ Tracking price changes for these same SKU IDs. "
+            send_pin_report(c, pin, "✅ Tracking price changes, new in-stock SKUs, and restocks. "
                             "Use the button below to remove this PIN.")
     save_data()
     return [] if first else lines
@@ -745,7 +756,8 @@ def add_pins(chat_id, pins, admin):
              "</code>. I’ll send each result as it finishes.")
     if ready:
         for pin in dict.fromkeys(ready):
-            send_pin_report(chat_id, pin, "Tracking same-SKU price changes. Use the button below to remove this PIN.")
+            send_pin_report(chat_id, pin, "Tracking price changes, new in-stock SKUs, and restocks. "
+                            "Use the button below to remove this PIN.")
     if rejected:
         send(chat_id, f"⚠️ Could not add <code>{esc(', '.join(dict.fromkeys(rejected)))}</code>. "
              f"This bot allows up to {MAX_PER_CHAT} PINs per chat and {MAX_TOTAL} total active PINs.")
